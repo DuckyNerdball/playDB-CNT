@@ -372,6 +372,57 @@ def remove_text_mod(load_dir):
     shutil.rmtree(Path(load_dir) / TITLE_ID / MOD_NAME, ignore_errors=True)
 
 
+# --- Bot names ------------------------------------------------------------------------------------
+# The game names its CPU players with the fixed format L"PCBot_%d" (main+0xed72a8, the function at
+# 0xed7184; the number is bot id - 10,000,000 + 1). An exefs IPS patch makes it read a name from a
+# table instead: x1 = table + index * 64 (adrp/add replace the format's address, and the
+# `mov w2, w20` that passed the number becomes `add x1, x1, x20, lsl #6`). The table lives in the
+# zero padding after the end of .rodata (0x563e45c..0x563f000), so no game data is overwritten.
+# The game copies a name into the player data only when it has at most 16 characters.
+
+MAIN_BUILD_ID = '14925E87E1ACD4D5E9D071AFEED230A1D4569F98'   # the network test's main
+BOT_NAME_TABLE = 0x563e460
+BOT_NAME_SLOTS = 41          # index 0 (not a bot) .. 40 (the game allows bot ids up to +0x27)
+BOT_NAME_STRIDE = 64
+BOT_NAME_CODE = {0xed72a8: 0xf0023b21,   # adrp x1, 0x563e000
+                 0xed72ac: 0x91118021,   # add  x1, x1, #0x460
+                 0xed72bc: 0x8b141821}   # add  x1, x1, x20, lsl #6
+BOT_NAMES = [
+    'Quellyn', 'Morholt', 'Folcard', 'Leofric', 'Hunter Schmidt', 'Shira', 'Settler Heloise',
+    'Sieglinde', 'Amalric', 'Hieronymus', 'The Darkwraith', 'McDonnell', 'Laurentius',
+    'Cleric Isolde', 'Abelard', 'Nymue', 'Elana', 'Knight Wulfric', 'Thale of Shulva', 'Alvina',
+]
+
+
+def bot_names_ips(names):
+    """IPS32 patch (offsets = address + 0x100, the NSO header) giving bot n the n-th name."""
+    table = bytearray()
+    for slot in range(BOT_NAME_SLOTS):
+        name = 'PCBot' if slot == 0 else names[(slot - 1) % len(names)]
+        if len(name) > 16 or '%' in name:
+            raise ValueError(f'bot name {name!r}: at most 16 characters, no %')
+        table += name.encode('utf-16-le').ljust(BOT_NAME_STRIDE, b'\0')
+    records = [(BOT_NAME_TABLE, bytes(table))]
+    records += [(address, struct.pack('<I', word)) for address, word in BOT_NAME_CODE.items()]
+    out = bytearray(b'IPS32')
+    for address, data in records:
+        for pos in range(0, len(data), 0xffff):
+            chunk = data[pos:pos + 0xffff]
+            out += struct.pack('>IH', 0x100 + address + pos, len(chunk)) + chunk
+    return bytes(out + b'EEOF')
+
+
+def install_bot_names(load_dir, rng=None):
+    """Random names for the 7 CPU players, new every launch: <load>/<title>/<mod>/exefs/<build>.ips."""
+    import random
+    names = BOT_NAMES[:]
+    (rng or random).shuffle(names)
+    target = Path(load_dir) / TITLE_ID / MOD_NAME / 'exefs' / f'{MAIN_BUILD_ID}.ips'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(bot_names_ips(names))
+    return names[:7]
+
+
 # --- Certificate archive for emulators without the online patch ---------------------------------
 # The game builds the trust list for its own TLS from the system's certificate archive (system data
 # 0100000000000800, ssl_TrustedCerts.bdf). Duskbloods emulator builds add the launcher's test CA to

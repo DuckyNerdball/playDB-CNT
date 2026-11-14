@@ -66,7 +66,14 @@ import re, secrets, threading, time
 
 ONLINE = os.environ.get('DUSK_ONLINE') == '1'
 BOTS_EVERYWHERE = os.environ.get('DUSK_BOTS') == '1'      # practice: every room is a bots room
-P2P_FORMAT = os.environ.get('DUSK_P2P_FORMAT', 'ip4')   # ip4 | ip4port | pid | empty (what p2p_host_info holds)
+# What p2p_host_info holds. The game reads it as 32 bytes (2026-11-12, traced with the gdbstub):
+# u32 version 1, u32 payload size 24, then the payload: the game server's IPv4 address (a
+# little-endian u32), its UDP port (u16 LE), 2 zero bytes and a 16-byte session key. The game then
+# binds UDP 15500 and handshakes with that address (FromSoftware's own UDP protocol, symmetric:
+# a game answers another game's handshake). 'session' builds that; the rest are old experiments.
+P2P_FORMAT = os.environ.get('DUSK_P2P_FORMAT', 'session')   # session | hex:<bytes> | ip4 | ip4port | pid | empty
+P2P_TARGET = os.environ.get('DUSK_P2P_TARGET', 'host')        # host | peer: whom the match host connects to
+GAME_PORT = int(os.environ.get('DUSK_GAME_PORT', '15500'))   # the UDP port every game binds after a match
 P2P_PORT = int(os.environ.get('DUSK_P2P_PORT', '0'))
 MIN_PLAYERS = max(1, int(os.environ.get('DUSK_MATCH_MIN', '2')))   # the game allows up to 8; 2 to play together
 MAX_PLAYERS = int(os.environ.get('DUSK_MATCH_MAX', '8'))
@@ -169,7 +176,8 @@ def _try_match(room, now):
     _matches[match_id] = {'room': room, 'members': [(pid, _players[pid]['ip']) for pid in group],
                           'spec': spec, 'bots': bots, 'created': now, 'delivered': set(),
                           'specs': {pid: _players[pid]['search'].get('spec') or {} for pid in group},
-                          'key': base64.b64encode(secrets.token_bytes(32)).decode(), 'registered': None}
+                          'key': base64.b64encode(secrets.token_bytes(32)).decode(), 'registered': None,
+                          'session_key': secrets.token_bytes(16)}
     for pid in group:
         _players[pid]['match'] = match_id
         _players[pid]['search'] = None
@@ -185,16 +193,31 @@ def _current_match(player, now):
     return match
 
 
-def _host_info(match, ctx):
+def _host_info(match, ctx, pid=None):
     host_pid, host_ip = match['members'][0]
     if host_ip.startswith('127.') or host_ip == '::1':
         host_ip = (ctx or {}).get('local') or host_ip     # the host reached its own server over loopback
     if host_ip.startswith('127.') or host_ip == '::1':
         host_ip = os.environ.get('DUSK_HOST_IP') or host_ip   # ...and is asking itself: its network address
+    # DUSK_P2P_TARGET=peer (test): the match host's game connects to the first other player's game
+    # instead of to itself; everyone else still connects to the host's game.
+    if P2P_TARGET == 'peer' and pid == host_pid and len(match['members']) > 1:
+        host_ip = match['members'][1][1]
     if P2P_FORMAT == 'pid':
         return [host_pid]
     if P2P_FORMAT == 'empty':
         return []
+    if P2P_FORMAT.startswith('hex:'):   # exact bytes, for experiments: hex:5aa53cc3...
+        return list(bytes.fromhex(P2P_FORMAT[4:]))
+    if P2P_FORMAT == 'session':
+        try:
+            packed_ip = bytes(int(x) for x in host_ip.split('.'))
+        except ValueError:
+            packed_ip = b''
+        if len(packed_ip) != 4:
+            return []
+        payload = packed_ip[::-1] + GAME_PORT.to_bytes(2, 'little') + bytes(2) + match['session_key']
+        return list((1).to_bytes(4, 'little') + len(payload).to_bytes(4, 'little') + payload)
     try:
         octets = [int(x) for x in host_ip.split('.')]
     except ValueError:
@@ -237,7 +260,7 @@ def wait_for_matching(value, ctx):
         match['delivered'].add(pid)
         match_id = player['match']
         result = {'result_type': 'MATCHED',
-                  'body_matched': {'matching_ticket_type': 'NORMAL_MATCH', 'p2p_host_info': _host_info(match, ctx),
+                  'body_matched': {'matching_ticket_type': 'NORMAL_MATCH', 'p2p_host_info': _host_info(match, ctx, pid),
                                    'match_id': match_id, 'normal_matching_result': {},
                                    'event_matching_result': {'event_match_type': 0}}}
     _log('online_matched_reply', pid=pid, match_id=match_id, p2p_host_info=result['body_matched']['p2p_host_info'])

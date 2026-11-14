@@ -3,12 +3,16 @@
 A small launcher (Windows, Linux and macOS) for running **The Duskbloods Network Test** on Eglantine-based Switch 2
 emulators (Eglantine, Lichii, Eden-style builds) with the online features served by local
 stand-in servers, either for yourself (offline, loopback only) or for a room of friends
-(online rooms, **still in testing and not working yet**: see [ONLINE.md](ONLINE.md)). New in 1.2.0: **Bot Match**, a full match against
-7 CPU players (see below). New in 1.2.1: the window can be resized, maximized and scrolled; Lichii
-160+ keeps its data in `%APPDATA%\lichii` and is handled; the Windows exe no longer trips antivirus
-false positives (see below). New in 1.3.0: **Patch Lichii**, which lets stock Lichii builds play
-(see below). New in 1.3.1: Bot Match comes in two modes, **Bot Match (Solo)** and **Bot Match (Duo)**. New in 1.3.2: hosting a room works on PCs with
-Radmin VPN or Hamachi.
+(online rooms, **not ready yet**: see below and [ONLINE.md](ONLINE.md)).
+
+> **Online mode is not ready yet, but it is close.** We are a small team right now. If you want to
+> take part in future online test matches, join our **Discord server: https://discord.gg/jX3KK8T4P**
+
+**New in 1.4.0** (full list in [CHANGELOG.md](CHANGELOG.md)): the Bot Match CPU players get random
+names instead of `PCBot_1`...`PCBot_7`, an **Allow in firewall** button for online rooms, and a
+lobby report in the launcher log while hosting. Earlier: **Bot Match** (1.2.0, Solo and Duo since
+1.3.1), a resizable window and no antivirus false positive (1.2.1), **Patch Lichii** for stock
+Lichii builds (1.3.0), and hosting with Radmin VPN or Hamachi installed (1.3.2).
 
 **Best with a Duskbloods emulator build** (Eglantine, or the Duskbloods Lichii builds v31 and
 later). The game needs its online services even offline, and those builds send it to the
@@ -57,13 +61,25 @@ the missions to the game's regulation and their names and descriptions to the ga
 languages), both built from your own game files. The text goes into the emulator's mod folder as
 `Bot Match (playDB-CNT)`. Untick **Bot Match** in the Setup tab to use the game's own files.
 
-## Online play (in testing, not working yet)
+Since 1.4.0 the 7 CPU players get random names at each start, picked from Quellyn, Morholt,
+Folcard, Leofric, Hunter Schmidt, Shira, Settler Heloise, Sieglinde, Amalric, Hieronymus, The
+Darkwraith, McDonnell, Laurentius, Cleric Isolde, Abelard, Nymue, Elana, Knight Wulfric, Thale of
+Shulva and Alvina (the launcher log lists them). This is a small code patch
+(`exefs/<build id>.ips` in the same mod folder) for the Network Test's game program; the game only
+shows names of up to 16 characters.
 
-> **Online play does not work yet.** You and your friends can connect (over a VPN or the same
-> network), reach the game's online menus and be matched together, but **the match never starts**:
-> the game goes back to searching after about 15 seconds. The step that starts a match needs a
-> game server the launcher doesn't have yet, and it is still being worked on and tested. To play a
-> full match today, use **Bot Match** (Battle Remembrance > Tutorials), which works offline.
+## Online play (not ready yet, but close)
+
+> **Online play does not work yet, but it is getting close.** You and your friends can connect
+> (over a VPN or the same network), reach the game's online menus and be matched together, but
+> **the match does not start yet**: the games go back to searching. Starting a match needs a game
+> server that runs the match, and we are building it: a single game already enters an online match
+> on our stand-in server with a remote player and CPU players, loads the stage and has briefly
+> reached gameplay. The match phases and a second real player come next.
+>
+> We are a small team right now. **If you want to take part in future online test matches, join
+> our Discord server: https://discord.gg/jX3KK8T4P.** To play a full match today, use **Bot Match**
+> (Battle Remembrance > Tutorials), which works offline.
 
 The **Online** tab has three modes: **Just me** (offline, as before), **Host a room** and
 **Join a room**. Everyone who types the **same room password** is matched together: one friend
@@ -82,10 +98,11 @@ or router port forwards. The Online tab lists the ports.
 | `play_duskbloods.py` | the launcher (Tk window, game/emulator discovery, process management) |
 | `tools/npln_server/` | local stand-in for the online login/session service (127.0.0.1; also the host's network addresses when hosting a room) |
 | `tools/dusk_server/` | "front door" stand-in for the game's own web API, plus the room matchmaking used by online rooms |
+| `CHANGELOG.md` | what changed in each version |
 | `ONLINE.md` | how to play online with friends (VPN recommendations, ports, troubleshooting) |
 | `assets/` | window art and the icon, taken from the game's title screen |
 | `build_exe.py` | builds the single-file `Play Duskbloods.exe` with PyInstaller (see its notes on the loader) |
-| `dusk_mods.py` | Bot Match (Solo/Duo): patches the regulation and adds the menu text |
+| `dusk_mods.py` | Bot Match (Solo/Duo): patches the regulation, adds the menu text and names the CPU players |
 | `tools/online_shim/` | the Patch Lichii `version.dll` (with source): online support for stock Lichii/Eden |
 | `tools/ooz/` | the open-source Kraken decompressor ooz (GPL-3.0, with source), used to read the game's menu text |
 | `linux/` | `play-duskbloods.sh` (starts the launcher on Linux) and `README-LINUX.md` |

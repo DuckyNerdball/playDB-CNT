@@ -39,8 +39,9 @@ def _tolerant(method):
 for _name in ('exists', 'is_file', 'is_dir'):
     setattr(Path, _name, _tolerant(getattr(Path, _name)))
 
-VERSION = '1.3.2'
+VERSION = '1.4.0'
 PORT = 18443
+GAME_PORT = 15500   # UDP: every game binds it after a match and handshakes with the match's game server
 ROOM_OFFSET = 2          # online play: the room service listens two ports above the game port
 WEB_PORT = 18090
 GAME_SHA = '2ef7b7bcd78905f30069d03aa44e1e124d83bd83bdcc1766bd3d01ea2ad137a3'
@@ -293,6 +294,60 @@ def remove_shim(exe):
         (Path(exe).parent / 'version.dll').unlink()
 
 
+# --- Windows firewall -----------------------------------------------------------------------------
+# After a match every game listens on UDP 15500 and the others connect to it, so the emulator must
+# accept incoming traffic. When a firewall prompt was dismissed, Windows adds BLOCK rules for that
+# program, and block rules win over allow rules: those are removed and replaced by allow rules.
+FIREWALL_RULE = 'playDB-CNT Duskbloods online'
+
+
+def firewall_allows(exe):
+    """True when our inbound allow rule for this emulator exists; None when unknown (not Windows)."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        done = subprocess.run(['netsh', 'advfirewall', 'firewall', 'show', 'rule',
+                               f'name={FIREWALL_RULE} (emulator)', 'verbose'], capture_output=True,
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = done.stdout.decode('utf-8', 'replace') + done.stdout.decode('mbcs', 'replace')
+    return done.returncode == 0 and str(exe).lower() in text.lower()
+
+
+def allow_in_firewall(exe):
+    """Allow the emulator and this launcher through the Windows firewall (one admin prompt).
+    Returns (ok, message)."""
+    if not IS_WINDOWS:
+        return False, 'Only needed on Windows.'
+    programs = [('emulator', str(exe)), ('launcher', sys.executable)]
+    lines = ['@echo off', 'set failed=0']
+    for label, program in programs:
+        lines += [f'netsh advfirewall firewall delete rule name=all dir=in program="{program}" >nul 2>&1',
+                  f'netsh advfirewall firewall add rule name="{FIREWALL_RULE} ({label})" dir=in action=allow '
+                  f'program="{program}" enable=yes profile=any >nul || set failed=1']
+    lines.append('exit /b %failed%')
+    script = Path(os.environ.get('TEMP', '.')) / 'playdb-firewall.cmd'
+    script.write_text('\n'.join(lines) + '\n', encoding='mbcs')  # text mode writes CRLF
+    command = ("$p = Start-Process -FilePath cmd.exe -ArgumentList '/c', '\"" + str(script).replace("'", "''") +
+               "\"' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode")
+    try:
+        done = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', command],
+                              capture_output=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                              timeout=180)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, f'Could not change the firewall: {error}'
+    finally:
+        try:
+            script.unlink()
+        except OSError:
+            pass
+    if done.returncode != 0:
+        return False, ('The firewall was not changed (the admin prompt was declined, or Windows refused). '
+                       'Press the button again and choose Yes.')
+    return True, 'Firewall: the emulator and the launcher may now receive connections on every network.'
+
+
 def data_dir_for(exe):
     """Portable builds keep their data in <folder>/user; Eden and older Lichii use %APPDATA%\\eden,
     Lichii 160 and later %APPDATA%\\lichii."""
@@ -475,6 +530,94 @@ def set_key(text, key, value):
     return text
 
 
+class RoomWatcher:
+    """While hosting: follows the front door's log and reports the lobby in the launcher's log:
+    friends' launchers joining (and with which password), their games connecting, and matches."""
+
+    def __init__(self, path, room, log):
+        self.path, self.room, self.log = Path(path), room[:8], log
+        self.done = threading.Event()
+        self.joined = set()       # addresses whose launcher joined this room
+        self.connected = set()    # addresses whose game signed in to this room
+        self.matches = 0
+        self.pending = None       # the latest match: {'id', 'pids', 'time', 'reported'}
+        self.pid_ip = {}          # player id -> address, for the messages
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def stop(self):
+        self.done.set()
+
+    def run(self):
+        position = 0
+        while not self.done.wait(1):
+            self.tick()
+            try:
+                with self.path.open('rb') as f:
+                    f.seek(position)
+                    chunk = f.read()
+            except OSError:
+                continue
+            end = chunk.rfind(b'\n') + 1   # only whole lines; the rest is read next time
+            position += end
+            for line in chunk[:end].splitlines():
+                try:
+                    self.event(json.loads(line))
+                except (ValueError, KeyError, TypeError):
+                    pass
+
+    def who(self, ip):
+        return 'you (this PC)' if ip.startswith('127.') else ip
+
+    def event(self, e):
+        kind, ip, room = e.get('event'), e.get('ip', '?'), e.get('room')
+        if kind == 'online_register' and not ip.startswith('127.'):
+            if room != self.room:
+                self.log(f'A player at {ip} joined with a different room password: they will not be matched '
+                         'with this room. Ask them to type the same password as you.', error=True)
+            elif ip not in self.joined:
+                self.joined.add(ip)
+                self.log(f'A player joined the lobby from {ip} ({len(self.joined)} so far).')
+        elif kind == 'online_player' and room == self.room and ip not in self.connected:
+            self.connected.add(ip)
+            others = len(self.connected - {i for i in self.connected if i.startswith('127.')})
+            self.log(f'Game connected: {self.who(ip)}. Players connected to this lobby: {len(self.connected)} '
+                     f'({others} friend{"s" if others != 1 else ""}).')
+        if kind == 'online_player':
+            self.pid_ip[e.get('pid')] = ip
+        if kind == 'online_match' and room == self.room:
+            players = e.get('players') or []
+            now = e.get('time') or time.time()
+            previous = self.pending
+            if previous and not previous['reported'] and previous['pids'] & set(players):
+                self.failed(previous, now)   # the same players searched again: that match did not start
+            addresses = ', '.join(self.who(a) for a in e.get('addresses') or [])
+            self.matches += 1
+            self.pending = {'id': e.get('match_id'), 'pids': set(players), 'time': now, 'reported': False}
+            self.log(f'Match #{e.get("match_id")} formed with {len(players)} player'
+                     f'{"s" if len(players) != 1 else ""}: {addresses}. The games are connecting to each other '
+                     '(UDP 15500)...')
+        elif kind == 'online_ticket' and self.pending and not self.pending['reported']:
+            match, when = self.pending, e.get('time') or 0
+            if e.get('pid') in match['pids'] and e.get('match') != match['id'] and when > match['time'] + 2:
+                self.failed(match, when, e.get('pid'))
+
+    def failed(self, match, when, pid=None):
+        match['reported'] = True
+        who = self.who(self.pid_ip.get(pid, '?')) if pid is not None else 'the players'
+        self.log(f'Match #{match["id"]}: {who} searched again after {when - match["time"]:.0f} s, so the '
+                 'games could not connect. Send the run folders (Open logs) of everyone in this match.',
+                 error=True)
+
+    def tick(self):
+        match = self.pending
+        if match and not match['reported'] and time.time() - match['time'] > 45:
+            match['reported'] = True
+            self.log(f'Match #{match["id"]}: nobody searched again for 45 s. The match may have started! '
+                     'Tell us what you see in the game.')
+
+
 class Session:
     """One play session: servers + emulator. Messages go to `log`."""
 
@@ -491,6 +634,7 @@ class Session:
         self.test = test_dir_for(self.data)
         self.processes = []
         self.run_dir = None
+        self.watcher = None
 
     def check_keys(self):
         keys = self.data / 'keys'
@@ -575,6 +719,11 @@ class Session:
                      'match against 7 CPU players, alone or in alliances of two.')
         except Exception as error:
             self.log(f'Bot Match text not added ({error}); the entries show without a name.')
+        try:
+            names = dusk_mods.install_bot_names(load)
+            self.log('CPU players this session: ' + ', '.join(names) + '.')
+        except Exception as error:
+            self.log(f'Bot names not changed ({error}); the CPU players are called PCBot.')
 
     def prepare_config(self, nand, save):
         config = config_file_for(self.data)
@@ -638,7 +787,8 @@ class Session:
         if self.mode == 'bots':  # practice: matchmaking on this PC, every match filled with bots
             front_env.update(DUSK_ONLINE='1', DUSK_BOTS='1')
         if hosting:
-            front_env.update(DUSK_ONLINE='1', DUSK_HOST_IP=stub_hosts[1] if len(stub_hosts) > 1 else '')
+            front_env.update(DUSK_ONLINE='1', DUSK_HOST_IP=stub_hosts[1] if len(stub_hosts) > 1 else '',
+                             DUSK_P2P_TARGET=self.online.get('p2p_target') or 'host')
             front_args += ['--bind', '0.0.0.0', '--room-port', str(PORT + ROOM_OFFSET),
                            '--room-name', self.online.get('name') or 'Duskbloods room']
         front = subprocess.Popen(
@@ -667,7 +817,9 @@ class Session:
                 self.stop()
                 return False
             shown = ', '.join(a for a in local_addresses()) or 'this PC\'s address'
-            self.log(f'Room open. Friends join with the address {shown} and the same password.')
+            self.log(f'Lobby hosted: room open. Friends join with the address {shown} and the same password.')
+            self.watcher = RoomWatcher(run / 'frontdoor.log', room_id(self.online['password']), self.log)
+            self.watcher.start()
         if self.mode == 'bots':
             self.log('Bots match: start matchmaking in the game; you are matched at once against bots.')
         return True
@@ -699,6 +851,10 @@ class Session:
     def start(self):
         if not self.check_keys():
             return None
+        if self.mode in ('join', 'host') and firewall_allows(self.emulator) is False:
+            self.log('Firewall: this emulator is not allowed to receive connections, so other players\' games '
+                     f'cannot reach it (UDP {GAME_PORT}). Press "Allow in firewall" in the Online tab once.',
+                     error=True)
         if not has_online_support(self.emulator):
             if shim_state(self.emulator) == 'ours' and SHIM.exists():
                 try:
@@ -744,6 +900,8 @@ class Session:
                    EDEN_NX2_CRASH_DUMP=str(run), EDEN_NX2_TRACE_TERMINATE='1')
         if self.mode in ('offline', 'bots'):  # offline: nothing but this PC
             env.update(EDEN_NX2_LOOPBACK_ONLY='1')
+        else:  # online test: Duskbloods builds log the match traffic (UDP 15500) in emulator.log
+            env.update(EDEN_NX2_LOG_SOCKETS='1')
         env.update({k: v for k, v in os.environ.items() if k.startswith('EDEN_NX2_') and k not in env})
         env.pop('SDL_AUDIODRIVER', None)
         if not IS_WINDOWS and not os.access(self.emulator, os.X_OK):
@@ -762,6 +920,9 @@ class Session:
         return game
 
     def stop(self):
+        if self.watcher:
+            self.watcher.stop()
+            self.watcher = None
         for proc in reversed(self.processes):  # the emulator, then both servers
             kill_tree(proc)
         if self.servers:
@@ -1121,6 +1282,9 @@ def run_gui():
     server_var = tk.StringVar(value=saved_online.get('server', ''))
     show_var = tk.IntVar(value=0)
     bots_var = tk.IntVar(value=0)  # the room 'bots' flag: kept for the server, no longer offered
+    p2p_var = tk.StringVar(value=saved_online.get('p2p_target', 'host'))
+    if p2p_var.get() not in ('host', 'peer'):
+        p2p_var.set('host')
 
     MODES = {
         'offline': ('Just me', 'Offline test',
@@ -1180,6 +1344,33 @@ def run_gui():
                    bg=PAGE, selectcolor=ITEM, activebackground=PAGE, activeforeground=GOLD,
                    highlightthickness=0).pack(side='left', padx=(6, 0))
 
+    fw_row = tk.Frame(right, bg=PAGE)
+    tk.Label(fw_row, text='Firewall', font=(SERIF, 11), fg=GOLD, bg=PAGE, width=14, anchor='w').pack(side='left')
+    fw_status = note(fw_row, '', DIM, size=9, wrap=250)
+
+    def firewall_clicked():
+        exe = selected_emulator()
+        if not exe:
+            log('Choose an emulator in the Setup tab first.', error=True)
+            return
+        log('Asking Windows for permission to allow the emulator and the launcher through the firewall...')
+
+        def work():
+            ok, message = allow_in_firewall(exe)
+            root.after(0, lambda: (log(message, error=not ok), refresh_firewall()))
+        threading.Thread(target=work, daemon=True).start()
+
+    button(fw_row, 'Allow in firewall', firewall_clicked).pack(side='left')
+    fw_status.pack(side='left', padx=(8, 0))
+
+    def refresh_firewall():
+        exe = selected_emulator()
+        allowed = firewall_allows(exe) if exe else None
+        fw_status.configure(text='allowed' if allowed else
+                            f'needed once on every player\'s PC (UDP {GAME_PORT} for the match)' if allowed is False
+                            else '',
+                            fg=GOOD if allowed else ERR)
+
     join_box = tk.Frame(right, bg=PAGE)
     tk.Label(join_box, text='Host\'s address', font=(SERIF, 11), fg=GOLD, bg=PAGE, width=14, anchor='w').pack(side='left')
     entry(join_box, server_var).pack(side='left', fill='x', expand=True, ipady=3)
@@ -1212,8 +1403,19 @@ def run_gui():
                 button(row, 'Copy', lambda a=address: copy_address(a)).pack(side='left', padx=6)
     note(host_box, 'Friends must reach this PC: the same home network, or a VPN such as Tailscale, ZeroTier or '
                    'Radmin (share that VPN\'s address). Over the internet, forward '
-                   f'TCP {PORT} and {PORT + ROOM_OFFSET}, TCP+UDP 3478-3479 and UDP 10025, 10125, 33334, 34343. '
-                   'Allow the launcher and the emulator in the Windows firewall when asked.', size=9, wrap=440).pack(fill='x', pady=(6, 0))
+                   f'TCP {PORT} and {PORT + ROOM_OFFSET}, TCP+UDP 3478-3479 and UDP 10025, 10125, 33334, 34343 '
+                   f'and {GAME_PORT} (the match itself, on every player\'s PC). Allow the launcher and the emulator '
+                   'in the Windows firewall when asked.', size=9, wrap=440).pack(fill='x', pady=(6, 0))
+    p2p_row = tk.Frame(host_box, bg=PAGE)
+    p2p_row.pack(fill='x', pady=(8, 0))
+    tk.Label(p2p_row, text='Match test', font=(SERIF, 11), fg=GOLD, bg=PAGE, width=14, anchor='nw').pack(side='left', anchor='n')
+    p2p_choices = tk.Frame(p2p_row, bg=PAGE)
+    p2p_choices.pack(side='left', fill='x', expand=True)
+    for value, text in (('host', 'A: everyone\'s game connects to mine (try this first)'),
+                        ('peer', 'B: my game connects to the first friend\'s game')):
+        tk.Radiobutton(p2p_choices, text=text, value=value, variable=p2p_var, font=(SERIF, 10), fg=TEXT, bg=PAGE,
+                       selectcolor=ITEM, activebackground=PAGE, activeforeground=GOLD, highlightthickness=0,
+                       anchor='w').pack(fill='x')
     guide_row = tk.Frame(right, bg=PAGE)
     guide_row.pack(side='bottom', fill='x')
 
@@ -1234,10 +1436,13 @@ def run_gui():
         _, title, text = MODES[mode]
         mode_title.configure(text=title)
         mode_text.configure(text=text)
-        for box in (pw_row, join_box, host_box):
+        for box in (pw_row, fw_row, join_box, host_box):
             box.pack_forget()
         if mode in ('join', 'host'):
             pw_row.pack(fill='x', pady=3)
+            if IS_WINDOWS:
+                fw_row.pack(fill='x', pady=3)
+                refresh_firewall()
         if mode == 'join':
             join_box.pack(fill='x', pady=3)
         elif mode == 'host':
@@ -1339,7 +1544,7 @@ def run_gui():
         if not main or not exe:
             return
         online = {'mode': mode_var.get(), 'password': password_var.get().strip(), 'server': server_var.get().strip(),
-                  'bots': bool(bots_var.get())}
+                  'bots': bool(bots_var.get()), 'p2p_target': p2p_var.get()}
         if online['mode'] in ('join', 'host') and not online['password']:
             show_tab('Online')
             log('Type a room password in the Online tab first: everyone with the same password plays together.',

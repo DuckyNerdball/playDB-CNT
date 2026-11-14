@@ -4,16 +4,16 @@ The launcher's **Online** tab lets you play The Duskbloods Network Test with fri
 types the **same room password** is matched together. One player **hosts** the room and the others
 **join** it.
 
-> **Online play does not work yet.** You and your friends can connect (over a VPN or the same
-> network), reach the game's online menus and be matched together, but **the match never starts**:
-> the game goes back to searching after about 15 seconds. The step that starts a match needs a
-> game server the launcher doesn't have yet, and it is still being worked on and tested. To play a
-> full match today, use **Bot Match** (Battle Remembrance > Tutorials), which works offline.
+> **Online play is not ready yet, but it is close.** You and your friends can connect (over a VPN
+> or the same network), reach the game's online menus and be matched together, but **the match does
+> not start yet**: the games go back to searching. Starting a match needs a game server that runs
+> the match; we are building it, and a single game already enters an online match on our stand-in
+> server (remote player, CPU players, stage loaded, briefly in gameplay). To play a full match
+> today, use **Bot Match** (Battle Remembrance > Tutorials), which works offline.
 >
-> What already works: hosting and joining a room, connecting everyone's game to the host (even over
-> a VPN), the game's online menus, and matchmaking (any 2 to 8 players in a room get matched).
-> What doesn't: the match itself. If you want to help test, see
-> [Reporting a problem](#reporting-a-problem): those logs are what get it fixed.
+> We are a small team right now. **If you want to take part in future online test matches, join our
+> Discord server: https://discord.gg/jX3KK8T4P.** Test logs (see
+> [Reporting a problem](#reporting-a-problem)) are what get it finished.
 
 ## Contents
 
@@ -148,8 +148,10 @@ connections at all. A VPN from the list above avoids all of this.
 5. Send your friends:
    * the **room password**, and
    * the right **address** from **Your address** (use **Copy**). That's the VPN address if you use a VPN.
-6. Press **Start game**. When Windows Firewall asks, click **Allow access** for **both private and
-   public networks**. Do this for the launcher and for the emulator.
+6. On Windows, press **Allow in firewall** in the Online tab once (new in 1.4.0; one admin prompt,
+   choose Yes). It lets the emulator and the launcher receive connections on every network. Then
+   press **Start game**. While you host, the launcher log reports who joined, whose game connected
+   and each match that forms.
 7. In the game, start online matchmaking. Your friends do the same.
 
 Keep the launcher open while you play. Closing the game stops the room for everyone.
@@ -162,7 +164,7 @@ Keep the launcher open while you play. Closing the game stops the room for every
 4. Type the **same room password** as the host. Capitals and spaces count.
 5. Type the **Host's address** they sent you, for example `10.147.17.23`.
 6. Wait until the host has pressed **Start game**, then press **Start game** yourself.
-7. Allow the emulator in Windows Firewall if asked, then start online matchmaking in the game.
+7. On Windows, press **Allow in firewall** once, then start online matchmaking in the game.
 
 ## Bot Match: a full match against 7 CPU players
 
@@ -205,9 +207,9 @@ built from your own game files. The text goes into the emulator's mod folder as
   check that both of you show *OK* and are ticked under **Auth**.
 * Test the connection: open a Command Prompt and run `ping <host address>`. If ping fails, the
   VPN isn't connected yet. If ping works but joining fails, it's the host's firewall. The host should
-  allow the launcher in Windows Firewall (Settings → Privacy & security → Windows Security →
-  Firewall & network protection → Allow an app through firewall), tick **Private** and **Public**,
-  and restart the room.
+  press **Allow in firewall** in the Online tab (or allow the launcher and the emulator by hand in
+  Windows Security → Firewall & network protection → Allow an app through firewall, ticking
+  **Private** and **Public**) and restart the room.
 
 **Matchmaking never finds anyone.**
 * Everyone must use the **exact same room password**. A different password is a different room.

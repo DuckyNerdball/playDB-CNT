@@ -158,6 +158,37 @@ static getaddrinfo_fn real_getaddrinfo;
 static gethostbyname_fn real_gethostbyname;
 static connect_fn real_connect;
 static sendto_fn real_sendto;
+typedef int (WSAAPI *recvfrom_fn)(SOCKET, char *, int, int, struct sockaddr *, int *);
+static recvfrom_fn real_recvfrom;
+
+/* The game's match traffic (UDP port 15500 after a match): the first 60 datagrams each way, then one
+ * in 200, so a test log shows how far the games' handshake gets. */
+#define GAME_PORT 15500
+static volatile LONG udp_out, udp_in;
+
+static void log_datagram(const char *direction, volatile LONG *counter, const char *data, int length,
+                         const struct sockaddr *peer) {
+    if (!log_file || !peer || peer->sa_family != AF_INET || length <= 0) return;
+    const struct sockaddr_in *in = (const struct sockaddr_in *)peer;
+    LONG n = InterlockedIncrement(counter);
+    if (n > 60 && n % 200) return;
+    char hex[2 * 24 + 1];
+    int shown = length < 24 ? length : 24;
+    for (int i = 0; i < shown; i++) sprintf_s(hex + 2 * i, 3, "%02x", (unsigned char)data[i]);
+    hex[2 * shown] = 0;
+    say("udp %s #%ld %d bytes %s %u.%u.%u.%u:%u %s", direction, n, length,
+        direction[0] == 'o' ? "to" : "from", in->sin_addr.S_un.S_un_b.s_b1, in->sin_addr.S_un.S_un_b.s_b2,
+        in->sin_addr.S_un.S_un_b.s_b3, in->sin_addr.S_un.S_un_b.s_b4, ntohs(in->sin_port), hex);
+}
+
+static int is_game_traffic(SOCKET s, const struct sockaddr *peer) {
+    if (peer && peer->sa_family == AF_INET && ntohs(((const struct sockaddr_in *)peer)->sin_port) == GAME_PORT)
+        return 1;
+    struct sockaddr_in local;
+    int size = sizeof local;
+    return getsockname(s, (struct sockaddr *)&local, &size) == 0 && local.sin_family == AF_INET &&
+           ntohs(local.sin_port) == GAME_PORT;
+}
 
 static int WSAAPI hook_getaddrinfo(PCSTR node, PCSTR service, const ADDRINFOA *hints, PADDRINFOA *result) {
     if (matches(node)) {
@@ -224,7 +255,16 @@ static int WSAAPI hook_sendto(SOCKET s, const char *buffer, int length, int flag
         WSASetLastError(WSAENETUNREACH);
         return SOCKET_ERROR;
     }
-    return real_sendto(s, buffer, length, flags, to, to_length);
+    const int sent = real_sendto(s, buffer, length, flags, to, to_length);
+    if (sent > 0 && is_game_traffic(s, to)) log_datagram("out", &udp_out, buffer, sent, to);
+    return sent;
+}
+
+static int WSAAPI hook_recvfrom(SOCKET s, char *buffer, int length, int flags, struct sockaddr *from,
+                                int *from_length) {
+    const int received = real_recvfrom(s, buffer, length, flags, from, from_length);
+    if (received > 0 && is_game_traffic(s, from)) log_datagram("in", &udp_in, buffer, received, from);
+    return received;
 }
 
 /* --- patching the emulator program ----------------------------------------------------------- */
@@ -307,17 +347,19 @@ static void install(void) {
     real_gethostbyname = (gethostbyname_fn)GetProcAddress(ws2, "gethostbyname");
     real_connect = (connect_fn)GetProcAddress(ws2, "connect");
     real_sendto = (sendto_fn)GetProcAddress(ws2, "sendto");
-    if (!real_getaddrinfo || !real_gethostbyname || !real_connect || !real_sendto) {
+    real_recvfrom = (recvfrom_fn)GetProcAddress(ws2, "recvfrom");
+    if (!real_getaddrinfo || !real_gethostbyname || !real_connect || !real_sendto || !real_recvfrom) {
         say("ws2_32 functions missing; nothing changed");
         return;
     }
-    /* ws2_32 ordinals: connect 4, gethostbyname 52, sendto 20 (getaddrinfo has no fixed one). */
+    /* ws2_32 ordinals: connect 4, recvfrom 17, gethostbyname 52, sendto 20 (getaddrinfo has none). */
     int hooked = 0;
     hooked += hook_import(base, "getaddrinfo", 0, (void *)hook_getaddrinfo) != NULL;
     hooked += hook_import(base, "gethostbyname", 52, (void *)hook_gethostbyname) != NULL;
     hooked += hook_import(base, "connect", 4, (void *)hook_connect) != NULL;
     hooked += hook_import(base, "sendto", 20, (void *)hook_sendto) != NULL;
-    say("hooked %d of 4 network functions", hooked);
+    hooked += hook_import(base, "recvfrom", 17, (void *)hook_recvfrom) != NULL;
+    say("hooked %d of 5 network functions", hooked);
     unblock_names(base);
 }
 
