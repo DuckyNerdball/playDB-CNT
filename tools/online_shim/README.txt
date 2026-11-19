@@ -12,8 +12,9 @@ Duskbloods emulator builds do:
     lifted for those names only),
   - connections to 127.0.0.1:443 go to the launcher's server (EDEN_NX2_ONLINE_SERVER),
   - offline, nothing but this PC is reachable (EDEN_NX2_LOOPBACK_ONLY).
-It hooks getaddrinfo, gethostbyname, connect and sendto in the emulator program only, and writes
-online_shim.log into the session's log folder.
+It hooks getaddrinfo, GetAddrInfoExW, gethostbyname, connect, sendto and recvfrom in the
+emulator program only, for IPv4 and IPv6 (Lichii build 341 and later connect over IPv6 sockets),
+and writes online_shim.log into the session's log folder.
 
 Started without the launcher, the emulator runs exactly as before.
 

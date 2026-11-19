@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.1 (2026-11-19)
+
+* **Patch Lichii works with Lichii build 341 and later** ([#19](https://github.com/sikoGD/playDB-CNT/issues/19)).
+  Those builds broke the patch in two ways, both fixed:
+  * Their block list of Nintendo server names is stored differently, so the patch no longer found
+    it and the game's login lookups were refused ("Online connection is required").
+  * They connect to the login server through IPv6 sockets, which the patch did not redirect.
+    The patch now handles IPv6 too: it redirects IPv6 connections, treats `::1` as this PC, and
+    also handles the newer `GetAddrInfoExW` lookups.
+  Tested with Lichii build 341: the game logs in and starts a new game. If you already patched
+  your Lichii, the launcher updates the patch by itself the next time you press **Start game**.
+* README rewritten: shorter, with the current state of things.
+
 ## 1.4.0 (2026-11-14)
 
 > **Online play is not ready yet, but it is getting close.** We are a small team right now. If you

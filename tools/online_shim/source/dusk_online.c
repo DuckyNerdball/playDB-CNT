@@ -10,8 +10,9 @@
  *   EDEN_NX2_LOOPBACK_ONLY=1           other names fail to resolve; non-loopback traffic refused
  *   EDEN_NX2_CRASH_DUMP=<folder>       where it writes online_shim.log
  *
- * Without EDEN_NX2_ONLINE_HOSTS it changes nothing. It hooks getaddrinfo, gethostbyname, connect
- * and sendto in the emulator program's import table only (no other module, no other process). */
+ * Without EDEN_NX2_ONLINE_HOSTS it changes nothing. It hooks getaddrinfo, GetAddrInfoExW,
+ * gethostbyname, connect, sendto and recvfrom in the emulator program's import table only (no other
+ * module, no other process), for IPv4 and IPv6. */
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -143,9 +144,32 @@ static int matches(const char *host) {
     return 0;
 }
 
+/* IPv4 127.x.x.x, IPv6 ::1 and the IPv4-mapped ::ffff:127.x.x.x. */
 static int is_loopback(const struct sockaddr *addr) {
-    return addr && addr->sa_family == AF_INET &&
-           (ntohl(((const struct sockaddr_in *)addr)->sin_addr.s_addr) >> 24) == 127;
+    if (!addr) return 0;
+    if (addr->sa_family == AF_INET)
+        return (ntohl(((const struct sockaddr_in *)addr)->sin_addr.s_addr) >> 24) == 127;
+    if (addr->sa_family == AF_INET6) {
+        const IN6_ADDR *a = &((const struct sockaddr_in6 *)addr)->sin6_addr;
+        static const BYTE v4_mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+        return IN6_IS_ADDR_LOOPBACK(a) || (memcmp(a->u.Byte, v4_mapped, 12) == 0 && a->u.Byte[12] == 127);
+    }
+    return 0;
+}
+
+static int is_ip(const struct sockaddr *addr) {
+    return addr && (addr->sa_family == AF_INET || addr->sa_family == AF_INET6);
+}
+
+static unsigned short port_of(const struct sockaddr *addr) {
+    return ntohs(addr->sa_family == AF_INET6 ? ((const struct sockaddr_in6 *)addr)->sin6_port
+                                             : ((const struct sockaddr_in *)addr)->sin_port);
+}
+
+/* Our names resolve to the loopback address of the family asked for. An IPv6-only lookup gets
+ * the IPv4-mapped ::ffff:127.0.0.1, which the connect hook below sends on to the server. */
+static const char *loopback_for(int family) {
+    return family == AF_INET6 ? "::ffff:127.0.0.1" : "127.0.0.1";
 }
 
 /* --- hooks ------------------------------------------------------------------------------------ */
@@ -192,8 +216,9 @@ static int is_game_traffic(SOCKET s, const struct sockaddr *peer) {
 
 static int WSAAPI hook_getaddrinfo(PCSTR node, PCSTR service, const ADDRINFOA *hints, PADDRINFOA *result) {
     if (matches(node)) {
-        say("resolve %s -> 127.0.0.1", node);
-        return real_getaddrinfo("127.0.0.1", service, hints, result);
+        const char *loopback = loopback_for(hints ? hints->ai_family : AF_UNSPEC);
+        say("resolve %s -> %s", node, loopback);
+        return real_getaddrinfo(loopback, service, hints, result);
     }
     int error = real_getaddrinfo(node, service, hints, result);
     if (error == 0 && loopback_only) {
@@ -228,8 +253,64 @@ static struct hostent *WSAAPI hook_gethostbyname(const char *name) {
     return entry;
 }
 
+/* Newer emulator builds also resolve with GetAddrInfoExW (wide names, optionally asynchronous). */
+typedef INT (WSAAPI *getaddrinfoexw_fn)(PCWSTR, PCWSTR, DWORD, LPGUID, const ADDRINFOEXW *, PADDRINFOEXW *,
+                                        struct timeval *, LPOVERLAPPED, LPLOOKUPSERVICE_COMPLETION_ROUTINE,
+                                        LPHANDLE);
+typedef void (WSAAPI *freeaddrinfoexw_fn)(PADDRINFOEXW);
+static getaddrinfoexw_fn real_getaddrinfoexw;
+static freeaddrinfoexw_fn real_freeaddrinfoexw;
+
+static int wide_to_ascii(PCWSTR wide, char *out, size_t size) {
+    if (!wide) return 0;
+    size_t i = 0;
+    for (; wide[i]; i++) {
+        if (i + 1 >= size || wide[i] > 0x7f) return 0;
+        out[i] = (char)wide[i];
+    }
+    out[i] = 0;
+    return 1;
+}
+
+static int is_loopback_name(const char *name) {
+    return _stricmp(name, "localhost") == 0 || strncmp(name, "127.", 4) == 0 || strcmp(name, "::1") == 0;
+}
+
+static INT WSAAPI hook_getaddrinfoexw(PCWSTR name, PCWSTR service, DWORD space, LPGUID provider,
+                                      const ADDRINFOEXW *hints, PADDRINFOEXW *result, struct timeval *timeout,
+                                      LPOVERLAPPED overlapped, LPLOOKUPSERVICE_COMPLETION_ROUTINE done,
+                                      LPHANDLE handle) {
+    char ascii[256];
+    const int named = wide_to_ascii(name, ascii, sizeof ascii);
+    if (named && matches(ascii)) {
+        const int family = hints ? hints->ai_family : AF_UNSPEC;
+        say("resolve %s -> %s (GetAddrInfoExW)", ascii, loopback_for(family));
+        return real_getaddrinfoexw(family == AF_INET6 ? L"::ffff:127.0.0.1" : L"127.0.0.1", service, space,
+                                   provider, hints, result, timeout, overlapped, done, handle);
+    }
+    if (!loopback_only || !name || (named && is_loopback_name(ascii)))
+        return real_getaddrinfoexw(name, service, space, provider, hints, result, timeout, overlapped, done,
+                                   handle);
+    if (!overlapped) {  /* synchronous: look it up and keep it only when it is this PC */
+        INT error = real_getaddrinfoexw(name, service, space, provider, hints, result, timeout, NULL, NULL, NULL);
+        if (error != 0 || !*result) return error;
+        for (ADDRINFOEXW *item = *result; item; item = item->ai_next) {
+            if (!is_loopback(item->ai_addr)) {
+                real_freeaddrinfoexw(*result);
+                *result = NULL;
+                break;
+            }
+        }
+        if (*result) return 0;
+    }
+    say("blocked lookup of %s (loopback only)", named ? ascii : "(a non-ASCII name)");
+    WSASetLastError(WSAHOST_NOT_FOUND);
+    return WSAHOST_NOT_FOUND;
+}
+
 static int WSAAPI hook_connect(SOCKET s, const struct sockaddr *name, int length) {
     struct sockaddr_in moved;
+    struct sockaddr_in6 moved6;
     if (has_server && name && name->sa_family == AF_INET && length >= (int)sizeof moved) {
         const struct sockaddr_in *in = (const struct sockaddr_in *)name;
         if (in->sin_addr.s_addr == htonl(INADDR_LOOPBACK) && in->sin_port == htons(443)) {
@@ -241,7 +322,25 @@ static int WSAAPI hook_connect(SOCKET s, const struct sockaddr *name, int length
             length = sizeof moved;
         }
     }
-    if (loopback_only && name && name->sa_family == AF_INET && !is_loopback(name)) {
+    /* An IPv6 socket to [::1]:443 or [::ffff:127.0.0.1]:443: the server listens on IPv4, so connect
+     * to its IPv4-mapped address and let this socket carry IPv4 (the emulator makes its IPv6
+     * sockets IPv6-only). */
+    if (has_server && name && name->sa_family == AF_INET6 && length >= (int)sizeof moved6 &&
+        is_loopback(name) && port_of(name) == 443) {
+        memset(&moved6, 0, sizeof moved6);
+        moved6.sin6_family = AF_INET6;
+        moved6.sin6_port = server.sin_port;
+        moved6.sin6_addr.u.Byte[10] = moved6.sin6_addr.u.Byte[11] = 0xff;
+        memcpy(&moved6.sin6_addr.u.Byte[12], &server.sin_addr, 4);
+        DWORD v6only = 0;
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&v6only, sizeof v6only);
+        say("connect [loopback]:443 (IPv6) -> [::ffff:%u.%u.%u.%u]:%u", server.sin_addr.S_un.S_un_b.s_b1,
+            server.sin_addr.S_un.S_un_b.s_b2, server.sin_addr.S_un.S_un_b.s_b3,
+            server.sin_addr.S_un.S_un_b.s_b4, ntohs(server.sin_port));
+        name = (const struct sockaddr *)&moved6;
+        length = sizeof moved6;
+    }
+    if (loopback_only && is_ip(name) && !is_loopback(name)) {
         say("refused connect to a non-loopback address (loopback only)");
         WSASetLastError(WSAECONNREFUSED);
         return SOCKET_ERROR;
@@ -251,7 +350,7 @@ static int WSAAPI hook_connect(SOCKET s, const struct sockaddr *name, int length
 
 static int WSAAPI hook_sendto(SOCKET s, const char *buffer, int length, int flags, const struct sockaddr *to,
                               int to_length) {
-    if (loopback_only && to && to->sa_family == AF_INET && !is_loopback(to)) {
+    if (loopback_only && is_ip(to) && !is_loopback(to)) {
         WSASetLastError(WSAENETUNREACH);
         return SOCKET_ERROR;
     }
@@ -313,27 +412,63 @@ static int blocks_ours(const char *entry) {
     return 0;
 }
 
+static const char *const block_names[] = {"srv.nintendo.net", "nintendo.net", "npln.nintendo.net",
+                                          "fromsoftware-game.net", "nintendo.com"};
+static const char never_matches[] = "\x01";  /* no host name contains byte 1 */
+
+/* A C string inside [lo, hi) of at most 64 characters, or NULL. */
+static const char *string_at(ULONG_PTR p, ULONG_PTR lo, ULONG_PTR hi) {
+    if (p < lo || p >= hi) return NULL;
+    const char *s = (const char *)p;
+    for (ULONG_PTR k = 0; k < 64 && p + k < hi; k++)
+        if (!s[k]) return k ? s : NULL;
+    return NULL;
+}
+
+static int is_block_name(const char *s) {
+    for (size_t k = 0; k < sizeof block_names / sizeof block_names[0]; k++)
+        if (strcmp(s, block_names[k]) == 0) return blocks_ours(block_names[k]);
+    return 0;
+}
+
 static void unblock_names(BYTE *base) {
-    static const char *const names[] = {"srv.nintendo.net", "nintendo.net", "npln.nintendo.net",
-                                        "fromsoftware-game.net", "nintendo.com"};
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
     IMAGE_SECTION_HEADER *section = IMAGE_FIRST_SECTION(nt);
+    const ULONG_PTR lo = (ULONG_PTR)base, hi = lo + nt->OptionalHeader.SizeOfImage;
+    int lifted = 0;
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, section++) {
         if (memcmp(section->Name, ".rdata", 6) != 0) continue;
         BYTE *start = base + section->VirtualAddress;
         size_t size = section->Misc.VirtualSize;
-        for (size_t k = 0; k < sizeof names / sizeof names[0]; k++) {
-            if (!blocks_ours(names[k])) continue;
-            size_t n = strlen(names[k]) + 1;  /* with its terminating NUL */
+        /* Older builds: the list's strings stand alone; blank the first byte of each. */
+        for (size_t k = 0; k < sizeof block_names / sizeof block_names[0]; k++) {
+            if (!blocks_ours(block_names[k])) continue;
+            size_t n = strlen(block_names[k]) + 1;  /* with its terminating NUL */
             for (size_t at = 1; at + n <= size; at++) {
-                if (start[at - 1] == 0 && memcmp(start + at, names[k], n) == 0) {
-                    BYTE never = 0x01;  /* no host name contains byte 1: the entry never matches */
+                if (start[at - 1] == 0 && memcmp(start + at, block_names[k], n) == 0) {
+                    BYTE never = 0x01;
                     write_memory(start + at, &never, 1);
-                    say("lifted the emulator's block of %s", names[k]);
+                    say("lifted the emulator's block of %s", block_names[k]);
+                    lifted++;
                 }
             }
         }
+        /* Newer builds (build 341+) share the text with longer strings, so change the list itself:
+         * an entry of the array of names that blocks one of ours (its neighbour is another host
+         * name) now points at a name that never matches. */
+        for (size_t at = sizeof(ULONG_PTR); at + 2 * sizeof(ULONG_PTR) <= size; at += sizeof(ULONG_PTR)) {
+            ULONG_PTR *slot = (ULONG_PTR *)(start + at);
+            const char *s = string_at(*slot, lo, hi);
+            if (!s || !is_block_name(s)) continue;
+            const char *next = string_at(slot[1], lo, hi), *prev = string_at(slot[-1], lo, hi);
+            if (!(next && strchr(next, '.')) && !(prev && strchr(prev, '.'))) continue;
+            ULONG_PTR value = (ULONG_PTR)never_matches;
+            write_memory(slot, &value, sizeof value);
+            say("lifted the emulator's block of %s (list entry)", s);
+            lifted++;
+        }
     }
+    if (!lifted) say("found no block of the launcher's names in this emulator");
 }
 
 static void install(void) {
@@ -359,7 +494,11 @@ static void install(void) {
     hooked += hook_import(base, "connect", 4, (void *)hook_connect) != NULL;
     hooked += hook_import(base, "sendto", 20, (void *)hook_sendto) != NULL;
     hooked += hook_import(base, "recvfrom", 17, (void *)hook_recvfrom) != NULL;
-    say("hooked %d of 5 network functions", hooked);
+    real_getaddrinfoexw = (getaddrinfoexw_fn)GetProcAddress(ws2, "GetAddrInfoExW");
+    real_freeaddrinfoexw = (freeaddrinfoexw_fn)GetProcAddress(ws2, "FreeAddrInfoExW");
+    int ex = real_getaddrinfoexw && real_freeaddrinfoexw &&
+             hook_import(base, "GetAddrInfoExW", 0, (void *)hook_getaddrinfoexw) != NULL;
+    say("hooked %d of 5 network functions%s", hooked, ex ? " and GetAddrInfoExW" : "");
     unblock_names(base);
 }
 

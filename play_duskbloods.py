@@ -39,7 +39,7 @@ def _tolerant(method):
 for _name in ('exists', 'is_file', 'is_dir'):
     setattr(Path, _name, _tolerant(getattr(Path, _name)))
 
-VERSION = '1.4.0'
+VERSION = '1.4.1'
 PORT = 18443
 GAME_PORT = 15500   # UDP: every game binds it after a match and handshakes with the match's game server
 ROOM_OFFSET = 2          # online play: the room service listens two ports above the game port
