@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.5.0 (2026-11-19)
+
+### New: the Mods tab
+
+The launcher has a third tab, **Mods**. Each mod is added to the emulator's mod folder when you
+press **Start game** and removed again when you untick it, so you can switch them on and off at any
+time. Untick everything to play the network test exactly as it is.
+
+* **Bot Match (Solo) and Bot Match (Duo)** (on by default): unchanged from 1.4.x, now a checkbox
+  here (it was in the Setup tab).
+* **CPU player names** (on by default): the random names for the 7 CPU players, now a separate
+  checkbox. Untick it to keep the game's own `PCBot_1` ... `PCBot_7`.
+* **NT Unlocks** (experimental): opens what the network test closes off:
+  * the curtain in the House of Night (*"Cannot venture past this point in the network test"*)
+  * the courtyard boundary (*"Here lies the boundary of the network test"*).
+
+  The hall behind the curtain is empty in this version of the game.
+* **Burning Forest Exploration** (experimental): lets you go down into the burning forest below the
+  cliffs of the first tutorial map and walk around there. For your own character only:
+  * no fall damage and no fall death
+  * no warp back up the cliff
+  * the camera keeps following you instead of switching to the fall-death camera.
+
+  Enemies and CPU players still fall and die as usual. While ticked it applies in every mode
+  (also Bot Match). Where there is no ground at all you keep falling: restart the mission.
+* **Courtyard training targets** (experimental): train against bosses in the courtyard
+  (**Travel > Courtyard Remembrance**). Each of the three targets (Giant adherent, Adherent,
+  Graveyard Scarecrow) can become another character:
+  * **10 bosses**: Vampyr, Beastridden, Giant Beastridden, Lady of the Bog, Rana, three Milhüsa
+    Cavalry variants, Dark Leopard, Nikke
+  * **8 kin**: Thaumaturge Avester, Gunslinger Beatrice, Baritone, Undead Marlowe, Nia, Valentius
+    the Unwise, Black Wulf of Mors, Gargoyle
+  * **the 6 Bloodsworn**: Albert, Bloodhand Jan, Trang Lanh, Sniper Layla, Senator Samir Patres and
+    Zork, with their own look and gear and the AI of the tutorial's duel opponent
+  * the three original targets, so they can be swapped around.
+
+  A boss, kin or Bloodsworn always comes alone (the Adherent target normally spawns three). The
+  target menu shows the character's name in your language. The picture stays the original one,
+  because the game has no other pictures.
+
 ## 1.4.1 (2026-11-19)
 
 * **Patch Lichii works with Lichii build 341 and later** ([#19](https://github.com/sikoGD/playDB-CNT/issues/19)).

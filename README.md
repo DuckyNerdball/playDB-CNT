@@ -15,6 +15,13 @@ launcher runs small stand-in servers on your own PC and starts the emulator poin
   on the whole map against 7 CPU players, from the first phase to the final battle:
   **Bot Match (Solo)** (everyone for themselves) and **Bot Match (Duo)** (alliances of two). The CPU
   players get random names each session.
+* **Mods** (the launcher's Mods tab): switch each one on or off before **Start game**.
+  * **Bot Match** and **CPU player names** (on by default).
+  * **NT Unlocks**: opens the hub curtain and the courtyard boundary that the network test closes.
+  * **Burning Forest Exploration**: go down into the burning forest below the cliffs of the first
+    tutorial map. No fall damage, no fall death, no warp back up, and the camera keeps following you.
+  * **Courtyard training targets**: turn the courtyard's training targets into bosses, kin or the
+    other Bloodsworn, one at a time, to practise boss fights.
 * **Patch Lichii** (Windows): lets stock Lichii and Eden builds play (see below).
 * **Online rooms** (in testing): friends can connect and be matched together, but the match itself
   does not start yet. See [ONLINE.md](ONLINE.md).
@@ -86,7 +93,7 @@ Then, in the launcher:
 | Path | What |
 |---|---|
 | `play_duskbloods.py` | the launcher (Tk window, emulator discovery, sessions) |
-| `dusk_mods.py` | Bot Match: regulation patch, menu text, CPU player names |
+| `dusk_mods.py` | the mods: Bot Match (regulation patch, menu text), CPU player names, NT Unlocks, Burning Forest Exploration, courtyard targets |
 | `tools/npln_server/`, `tools/dusk_server/` | the stand-in servers and the room matchmaking |
 | `tools/online_shim/` | the Patch Lichii `version.dll`, with source |
 | `tools/ooz/` | the Kraken decompressor ooz (GPL-3.0, with source), to read the game's menu text |

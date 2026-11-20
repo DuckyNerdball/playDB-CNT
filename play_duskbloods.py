@@ -39,7 +39,7 @@ def _tolerant(method):
 for _name in ('exists', 'is_file', 'is_dir'):
     setattr(Path, _name, _tolerant(getattr(Path, _name)))
 
-VERSION = '1.4.1'
+VERSION = '1.5.0'
 PORT = 18443
 GAME_PORT = 15500   # UDP: every game binds it after a match and handshakes with the match's game server
 ROOM_OFFSET = 2          # online play: the room service listens two ports above the game port
@@ -60,6 +60,9 @@ SERVER = TOOLS / 'npln_server'
 PKI_SOURCE_NOTE = 'generated on first run'
 FRONT = TOOLS / 'dusk_server'
 SETTINGS = HERE / 'launcher_settings.json'
+# The Mods tab: each one a LayeredFS mod in the emulator's mod folder, added or removed at every start.
+DEFAULT_MODS = {'bot_match': True, 'bot_names': True, 'nt_unlocks': False, 'exploration': False,
+                'courtyard': {}}
 ONLINE_GUIDE = 'https://github.com/sikoGD/playDB-CNT/blob/main/ONLINE.md'
 NO_ONLINE_SUPPORT = ('This emulator does not have the Duskbloods online support (it is missing the switches that '
                      'send the game to the launcher\'s servers), so the game stops at "Online connection is '
@@ -621,8 +624,9 @@ class RoomWatcher:
 class Session:
     """One play session: servers + emulator. Messages go to `log`."""
 
-    def __init__(self, game_main, emulator, log, online=None, bot_match=True):
-        self.bot_match = bot_match
+    def __init__(self, game_main, emulator, log, online=None, bot_match=True, mods=None):
+        self.mods = dict(DEFAULT_MODS, **(mods or {}))
+        self.bot_match = bot_match and self.mods['bot_match']
         self.online = online or {'mode': 'offline'}
         self.mode = self.online.get('mode', 'offline')
         self.servers = False
@@ -703,27 +707,58 @@ class Session:
         return self.data / 'load'
 
     def install_mods(self):
-        """Bot Match's name and description in every language (a LayeredFS mod), or none."""
+        """The Mods tab's choices as LayeredFS mods in the emulator's mod folder (or removed)."""
         load = self.load_directory()
-        if not self.bot_match:
-            dusk_mods.remove_text_mod(load)
-            return
         ooz = TOOLS / 'ooz' / ('ooz.exe' if IS_WINDOWS else 'ooz')
-        if not ooz.exists():
-            self.log('Bot Match (Solo) and (Duo) are in Battle Remembrance > Tutorials (their names are not '
-                     'shown on this system).')
-            return
-        try:
-            dusk_mods.install_text_mod(dusk_mods.GameFiles(self.game_main), load, ooz, self.log)
+        game = dusk_mods.GameFiles(self.game_main)
+        courtyard = {slot: key for slot, key in (self.mods.get('courtyard') or {}).items()
+                     if slot in dusk_mods.COURTYARD_SLOTS and key in dusk_mods.COURTYARD_CHARACTERS}
+        if not self.bot_match and not courtyard:
+            dusk_mods.remove_text_mod(load)
+        elif not ooz.exists():
+            self.log('The mods\' names are not shown on this system (no text decompressor).')
+        else:
+            try:   # one text mod for both: the game's menu text is a single file
+                dusk_mods.install_text_mod(game, load, ooz, self.log, missions=self.bot_match,
+                                           courtyard=courtyard)
+            except Exception as error:
+                self.log(f'Menu text not added ({error}); Bot Match shows without a name.')
+        if self.bot_match:
             self.log('Bot Match (Solo) and Bot Match (Duo) are in Battle Remembrance > Tutorials: a full '
                      'match against 7 CPU players, alone or in alliances of two.')
-        except Exception as error:
-            self.log(f'Bot Match text not added ({error}); the entries show without a name.')
-        try:
-            names = dusk_mods.install_bot_names(load)
-            self.log('CPU players this session: ' + ', '.join(names) + '.')
-        except Exception as error:
-            self.log(f'Bot names not changed ({error}); the CPU players are called PCBot.')
+        if self.mods['bot_names']:
+            try:
+                names = dusk_mods.install_bot_names(load)
+                self.log('CPU players this session: ' + ', '.join(names) + '.')
+            except Exception as error:
+                self.log(f'Bot names not changed ({error}); the CPU players are called PCBot.')
+        else:
+            dusk_mods.remove_bot_names(load)
+        if self.mods['nt_unlocks'] and ooz.exists():
+            try:
+                if dusk_mods.install_nt_unlocks(game, load, ooz):
+                    self.log('NT Unlocks added: the House of Night curtain and the courtyard boundary are open.')
+            except Exception as error:
+                self.log(f'NT Unlocks not added ({error}).', error=True)
+        else:
+            dusk_mods.remove_nt_unlocks(load)
+        if self.mods['exploration']:
+            try:
+                dusk_mods.install_exploration(load)
+                self.log('Burning Forest Exploration: no fall damage, fall death, warp back or fall camera for you.')
+            except Exception as error:
+                self.log(f'Burning Forest Exploration not added ({error}).', error=True)
+        else:
+            dusk_mods.remove_exploration(load)
+        if courtyard and ooz.exists():
+            try:
+                names = dusk_mods.install_courtyard_targets(game, load, ooz, courtyard)
+                self.log('Courtyard targets (Travel / Courtyard Remembrance): ' + ', '.join(
+                    f'{dusk_mods.COURTYARD_SLOTS[slot]["label"]} -> {name}' for slot, name in names.items()) + '.')
+            except Exception as error:
+                self.log(f'Courtyard targets not changed ({error}).', error=True)
+        else:
+            dusk_mods.remove_courtyard_targets(load)
 
     def prepare_config(self, nand, save):
         config = config_file_for(self.data)
@@ -733,7 +768,8 @@ class Session:
             return
         text = config.read_text(encoding='utf-8')
         for key, value in (('nand_directory', nand.as_posix()), ('save_directory', save.as_posix()),
-                           ('airplane_mode', 'false'), ('use_gdbstub', 'false'),
+                           ('airplane_mode', 'false'),
+                           ('use_gdbstub', 'true' if os.environ.get('PLAYDB_GDBSTUB') else 'false'),
                            ('check_for_updates', 'false')):
             text = set_key(text, key, value)
         # A network adapter name saved on another PC (e.g. a VPN) does not exist here and makes the
@@ -1108,7 +1144,7 @@ def run_gui():
     # --- top tab bar (L | Setup | Online | R) ---------------------------------------------------
     tabbar = tk.Frame(content, bg=BAR, highlightthickness=1, highlightbackground=BAR_EDGE)
     tabbar.pack(fill='x')
-    pages, tab_widgets, order = {}, {}, ['Setup', 'Online']
+    pages, tab_widgets, order = {}, {}, ['Setup', 'Online', 'Mods']
     current = {'tab': 'Setup'}
 
     def show_tab(name):
@@ -1154,7 +1190,8 @@ def run_gui():
     holder.pack(fill='both', padx=14, pady=(0, 8))
     body = tk.Frame(holder, bg=PAGE, padx=14, pady=4)
     online_tab = tk.Frame(holder, bg=PAGE, padx=10, pady=6)
-    pages.update(Setup=body, Online=online_tab)
+    mods_tab = tk.Frame(holder, bg=PAGE, padx=14, pady=4)
+    pages.update(Setup=body, Online=online_tab, Mods=mods_tab)
 
     # --- Setup page -----------------------------------------------------------------------------
     heading(body, 'Game')
@@ -1260,11 +1297,58 @@ def run_gui():
     emu_status = note(body, '', size=9, wrap=640)
     emu_status.pack(fill='x', padx=(16, 0), pady=(2, 6))
 
-    bot_match_var = tk.IntVar(value=0 if settings.get('bot_match') is False else 1)
-    tk.Checkbutton(body, text='Bot Match (Solo) and Bot Match (Duo): a full Dusk Battle against 7 CPU '
-                              'players, alone or in alliances of two, added to Battle Remembrance > Tutorials', variable=bot_match_var, font=(SERIF, 10), fg=TEXT,
-                   bg=PAGE, selectcolor=ITEM, activebackground=PAGE, activeforeground=GOLD, highlightthickness=0,
-                   anchor='w', wraplength=640, justify='left').pack(fill='x', padx=(12, 0), pady=(0, 4))
+    # --- Mods page ------------------------------------------------------------------------------
+    saved_mods = dict(DEFAULT_MODS, **(settings.get('mods') or {}))
+    if settings.get('bot_match') is False and 'mods' not in settings:   # set in 1.4.1 or earlier
+        saved_mods['bot_match'] = False
+    if settings.get('mods', {}).get('courtyard_boss'):   # 1.5.0 test builds: one slot only
+        saved_mods['courtyard'] = {'giant': settings['mods']['courtyard_boss']}
+    mod_vars = {key: tk.IntVar(value=1 if on else 0) for key, on in saved_mods.items()
+                if isinstance(on, bool)}
+    character_keys = [''] + list(dusk_mods.COURTYARD_CHARACTERS)
+    character_labels = ['Unchanged'] + [f'{c["kind"]}: {c["name"]}'
+                                        for c in dusk_mods.COURTYARD_CHARACTERS.values()]
+    saved_courtyard = saved_mods.get('courtyard') or {}
+    slot_vars = {slot: tk.StringVar(value=character_labels[character_keys.index(saved_courtyard[slot])]
+                                    if saved_courtyard.get(slot) in character_keys else character_labels[0])
+                 for slot in dusk_mods.COURTYARD_SLOTS}
+    heading(mods_tab, 'Mods')
+    note(mods_tab, "Changes to the game, added to the emulator's mod folder when you press Start game and "
+                   'removed again when you untick them. Untick everything to play the network test as it is.',
+         size=9, wrap=640).pack(fill='x', padx=(16, 0), pady=(0, 6))
+    for key, title, text in (
+            ('bot_match', 'Bot Match (Solo) and Bot Match (Duo)',
+             'A full Dusk Battle on the whole map against 7 CPU players, alone or in alliances of two. '
+             'In Battle Remembrance > Tutorials.'),
+            ('bot_names', 'CPU player names',
+             'The CPU players get random names (Quellyn, Morholt, Shira, Alvina...) instead of PCBot_1 to '
+             'PCBot_7. New names every start; the launcher log lists them.'),
+            ('nt_unlocks', 'NT Unlocks (experimental)',
+             'Opens what the network test closes off: the curtain in the House of Night ("Cannot venture '
+             'past this point") and the courtyard boundary ("Here lies the boundary of the network test"). '
+             'The areas behind them may be unfinished.'),
+            ('exploration', 'Burning Forest Exploration (experimental)',
+             'Lets you go down into the burning forest below the cliffs of the first tutorial map: falls never '
+             'hurt or kill you, the game no longer warps you back up and the camera keeps following you. Only '
+             'your own character; applies to every mode while ticked (also Bot Match). Where there is no '
+             'ground at all you keep falling, so restart the mission.')):
+        tk.Checkbutton(mods_tab, text=title, variable=mod_vars[key], font=(SERIF, 11), fg=TEXT,
+                       bg=PAGE, selectcolor=ITEM, activebackground=PAGE, activeforeground=GOLD,
+                       highlightthickness=0, anchor='w').pack(fill='x', padx=(12, 0), pady=(6, 0))
+        note(mods_tab, text, size=9, wrap=620).pack(fill='x', padx=(40, 0))
+    tk.Label(mods_tab, text='Courtyard training targets (experimental)', font=(SERIF, 11), fg=TEXT, bg=PAGE,
+             anchor='w').pack(fill='x', padx=(16, 0), pady=(10, 0))
+    note(mods_tab, 'Train against bosses, kin, Bloodsworn or other enemies: in the courtyard (Travel / '
+                   'Courtyard Remembrance), each target can become another character. The target menu shows '
+                   'its name; the picture stays the original (the game has no other pictures).',
+         size=9, wrap=620).pack(fill='x', padx=(40, 0), pady=(0, 2))
+    for slot, info in dusk_mods.COURTYARD_SLOTS.items():
+        row = tk.Frame(mods_tab, bg=PAGE)
+        row.pack(fill='x', padx=(40, 0), pady=(2, 0))
+        tk.Label(row, text=info['label'], font=(SERIF, 10), fg=TEXT, bg=PAGE, width=20,
+                 anchor='w').pack(side='left')
+        ttk.Combobox(row, textvariable=slot_vars[slot], values=character_labels, state='readonly', width=36,
+                     style='Dusk.TCombobox', font=(SERIF, 10)).pack(side='left', ipady=2)
 
     def selected_emulator():
         label = emu_var.get()
@@ -1554,9 +1638,14 @@ def run_gui():
             show_tab('Online')
             log('Type the host\'s address in the Online tab first.', error=True)
             return
-        settings.update(game=game_var.get(), emulator=str(exe), online=online, bot_match=bool(bot_match_var.get()))
+        mods = {key: bool(var.get()) for key, var in mod_vars.items()}
+        mods['courtyard'] = {slot: character_keys[character_labels.index(var.get())]
+                             for slot, var in slot_vars.items()
+                             if var.get() in character_labels and character_labels.index(var.get())}
+        settings.update(game=game_var.get(), emulator=str(exe), online=online, mods=mods,
+                        bot_match=mods['bot_match'])
         save_settings(settings)
-        session = Session(main, exe, log, online, bot_match=bool(bot_match_var.get()))
+        session = Session(main, exe, log, online, mods=mods)
         state['session'] = session
         refresh()
 

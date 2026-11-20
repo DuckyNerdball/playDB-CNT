@@ -121,8 +121,25 @@ def bnd_entries(bnd):
     return out
 
 
-def patch_regulation(blob):
-    """The regulation with both Bot Matches in the Tutorials tab."""
+MAP_INFO_PARAM = 'MapDefaultInfoParam.param'
+MAP_INFO_LOW = 0x24       # int: the map's lowest height (-100 on the surface maps); the camera stays above it
+EXPLORATION_LOW = -2000
+
+
+def param_rows(bnd, name):
+    """{row id: data offset} of a param in the regulation's BND4."""
+    param = next((e for e in bnd_entries(bnd) if e[2] == name), None)
+    if param is None:
+        raise ValueError(f'{name} not found')
+    base = param[3]
+    return {rid: base + offset for rid, offset in
+            (struct.unpack_from('<ixxxxQ', bnd, base + 0x40 + i * 24)
+             for i in range(struct.unpack_from('<H', bnd, base + 0xa)[0]))}
+
+
+def patch_regulation(blob, missions=True, exploration=False):
+    """The regulation with both Bot Matches in the Tutorials tab and/or (Burning Forest Exploration)
+    the surface maps' lowest height moved far down."""
     iv, body = blob[:16], blob[16:]
     if len(body) % 16:
         raise ValueError('regulation is not a whole number of AES blocks')
@@ -143,12 +160,16 @@ def patch_regulation(blob):
     ordered = sorted(rows.values())
     if len(ordered) < 2 or ordered[1] - ordered[0] != MISSION_ROW_SIZE:
         raise ValueError(f'{MISSION_PARAM} has an unexpected layout')
-    for mission in MISSIONS:
+    for mission in MISSIONS if missions else ():
         row = rows.get(mission.row)
         if row is None or struct.unpack_from('<I', bnd, row + 4)[0] != mission.text_id or bnd[row + 0x17] != 8:
             raise ValueError(f'{MISSION_PARAM} row {mission.row} is not the 8-player full map')
         struct.pack_into('<I', bnd, row + 8, TUTORIAL_TAB)   # tab: Tutorials
         struct.pack_into('<i', bnd, row + 0x5c, -1)          # no unlock condition
+    if exploration:
+        for row in param_rows(bnd, MAP_INFO_PARAM).values():
+            if -200 <= struct.unpack_from('<i', bnd, row + MAP_INFO_LOW)[0] < 0:
+                struct.pack_into('<i', bnd, row + MAP_INFO_LOW, EXPLORATION_LOW)
     data = game_zstd(bytes(bnd))
     header = bytearray(plain[:0x4c])
     struct.pack_into('>II', header, 0x1c, len(bnd), len(data))
@@ -235,13 +256,63 @@ class MissingTables(ValueError):
     """This language's archive has no mission text tables."""
 
 
-def patch_menu(blob, ooz, language):
+MENU_TEXT_FMG = 200            # PHX_MenuText (menu_nt): courtyard target names, Bloodsworn names
+BUDDY_NAME_FMG = 235           # BuddyName (menu_nt): kin names
+NPC_NAME_FMG = 18              # NpcName in item_nt.msgbnd.dcx
+
+
+def npc_names(blob, ooz):
+    """{name id: text} of a language's NpcName table (item_nt.msgbnd.dcx)."""
+    bnd = undcx(blob, ooz)
+    for _, fid, _, offset, size in bnd_entries(bnd):
+        if fid == NPC_NAME_FMG:
+            return fmg_get(bnd[offset:offset + size])
+    return {}
+
+
+def fmg_get(fmg):
+    groups, count = struct.unpack_from('<ii', fmg, 0xc)
+    table = struct.unpack_from('<q', fmg, 0x18)[0]
+    out = {}
+    for g in range(groups):
+        index, first, last = struct.unpack_from('<iii', fmg, 0x28 + g * 0x10)
+        for k in range(last - first + 1):
+            offset = struct.unpack_from('<q', fmg, table + (index + k) * 8)[0]
+            if offset:
+                end = offset
+                while fmg[end:end + 2] != b'\0\0':
+                    end += 2
+                out[first + k] = fmg[offset:end].decode('utf-16le')
+    return out
+
+
+def patch_menu(blob, ooz, language, missions=True, courtyard=None, npc_name_table=None):
+    """menu_nt with the Bot Match mission text and/or the courtyard targets renamed after the
+    characters that replace them ({slot: character key}, names in this language)."""
     bnd = bytearray(undcx(blob, ooz))
     entries = {e[1]: e for e in bnd_entries(bnd)}
-    if NAME_FMG not in entries or INFO_FMG not in entries:
+    texts = {}
+    if missions:
+        if NAME_FMG not in entries or INFO_FMG not in entries:
+            raise MissingTables(language)
+        texts[NAME_FMG] = {m.text_id: m.name for m in MISSIONS}
+        texts[INFO_FMG] = {m.text_id: m.info_for(language) for m in MISSIONS}
+    if courtyard and MENU_TEXT_FMG in entries:
+        tables = {'npc': npc_name_table or {}}
+        for source, fid in (('menu', MENU_TEXT_FMG), ('buddy', BUDDY_NAME_FMG)):
+            if fid in entries:
+                e = entries[fid]
+                tables[source] = fmg_get(bytes(bnd[e[3]:e[3] + e[4]]))
+        names = texts.setdefault(MENU_TEXT_FMG, {})
+        for slot, key in courtyard.items():
+            character = COURTYARD_CHARACTERS[key]
+            source, text_id = character['text']
+            name = (tables.get(source, {}).get(text_id) or character['name']).strip()
+            name_id, info_id = COURTYARD_SLOTS[slot]['text']
+            names[name_id] = name
+            names[info_id] = name
+    if not texts:
         raise MissingTables(language)
-    texts = {NAME_FMG: {m.text_id: m.name for m in MISSIONS},
-             INFO_FMG: {m.text_id: m.info_for(language) for m in MISSIONS}}
     for fid, text in texts.items():
         at, _, _, offset, size = entries[fid]
         data = fmg_set(bytes(bnd[offset:offset + size]), text)
@@ -328,8 +399,11 @@ class GameFiles:
         return sorted(names)
 
 
-def install_text_mod(game, load_dir, ooz, log):
-    """Write the Bot Match menu text for every language into <load>/<title>/<mod>/romfs/msg."""
+def install_text_mod(game, load_dir, ooz, log, missions=True, courtyard=None):
+    """Write the menu text for every language into <load>/<title>/<mod>/romfs/msg: the Bot Match
+    missions' names and descriptions and/or, with `courtyard` ({slot: character key}), the courtyard
+    targets renamed after the characters that replace them (the game's own, translated names)."""
+    courtyard = {s: k for s, k in (courtyard or {}).items() if k in COURTYARD_CHARACTERS}
     mod = Path(load_dir) / TITLE_ID / MOD_NAME
     sources = {lang: game.read(f'msg/{lang}/menu_nt.msgbnd.dcx') for lang in game.languages()}
     sources = {lang: blob for lang, blob in sources.items() if blob}
@@ -339,20 +413,25 @@ def install_text_mod(game, load_dir, ooz, log):
     for lang in sorted(sources):
         digest.update(lang.encode() + hashlib.sha256(sources[lang]).digest())
     wanted = {'version': STAMP_VERSION, 'source': digest.hexdigest(),
-              'missions': [[m.row, m.name, m.info] for m in MISSIONS]}
+              'missions': [[m.row, m.name, m.info] for m in MISSIONS] if missions else [],
+              'courtyard': sorted(courtyard.items())}
     stamp = mod / STAMP
     try:
         if json.loads(stamp.read_text(encoding='utf-8')) == wanted:
             return False
     except (OSError, ValueError):
         pass
-    log('Adding the Bot Match names and descriptions to the game text (first start only)...')
+    log('Adding the mods\' names and descriptions to the game text...')
     staging = mod.with_name(MOD_NAME + '.new')
     shutil.rmtree(staging, ignore_errors=True)
     written = 0
     for lang, blob in sources.items():
+        npc_table = None
+        if any(COURTYARD_CHARACTERS[k]['text'][0] == 'npc' for k in courtyard.values()):
+            item = game.read(f'msg/{lang}/item_nt.msgbnd.dcx')
+            npc_table = npc_names(item, ooz) if item else None
         try:
-            data = patch_menu(blob, ooz, lang)
+            data = patch_menu(blob, ooz, lang, missions, courtyard, npc_table)
         except MissingTables:  # a stub language without the mission text (araae, thath)
             continue
         target = staging / 'romfs/msg' / lang / 'menu_nt.msgbnd.dcx'
@@ -412,15 +491,336 @@ def bot_names_ips(names):
     return bytes(out + b'EEOF')
 
 
+NAMES_MOD = 'CPU Names (playDB-CNT)'
+
+
 def install_bot_names(load_dir, rng=None):
     """Random names for the 7 CPU players, new every launch: <load>/<title>/<mod>/exefs/<build>.ips."""
     import random
     names = BOT_NAMES[:]
     (rng or random).shuffle(names)
-    target = Path(load_dir) / TITLE_ID / MOD_NAME / 'exefs' / f'{MAIN_BUILD_ID}.ips'
+    old = Path(load_dir) / TITLE_ID / MOD_NAME / 'exefs'   # 1.4.0-1.4.1 kept the patch in the Bot Match mod
+    shutil.rmtree(old, ignore_errors=True)
+    target = Path(load_dir) / TITLE_ID / NAMES_MOD / 'exefs' / f'{MAIN_BUILD_ID}.ips'
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(bot_names_ips(names))
     return names[:7]
+
+
+def remove_bot_names(load_dir):
+    shutil.rmtree(Path(load_dir) / TITLE_ID / NAMES_MOD, ignore_errors=True)
+    shutil.rmtree(Path(load_dir) / TITLE_ID / MOD_NAME / 'exefs', ignore_errors=True)
+
+
+# --- NT unlocks -----------------------------------------------------------------------------------
+# The event scripts check "is this the network test version" (command 3[27]) in six events. Two of
+# them block the player:
+#   m80 (House of Night) event 180000550 switches on an invisible wall (asset 8001500) in front of
+#     the curtain and shows "Cannot venture past this point in the network test". Patched: the wall's
+#     ChangeAssetEnableState(2005[03]) argument 1 -> 0.
+#   m81 (courtyard) event 181001840 sends the player back at "the boundary of the network test".
+#     Patched: its two 3[27] conditions wait for "not the network test" instead (never true).
+
+NT_MOD = 'NT Unlocks (playDB-CNT)'
+NT_STAMP = 'ntunlocks.json'
+NT_STAMP_VERSION = 7
+
+
+def emevd_events(data):
+    """{event id: [(bank, id, args offset, args bytes)]} of an EMEVD (64-bit layout)."""
+    q = lambda o: struct.unpack_from('<q', data, o)[0]
+    if data[:4] != b'EVD\0':
+        raise ValueError('not an EMEVD')
+    events_at, instructions_at, args_at = q(0x18), q(0x28), q(0x78)
+    out = {}
+    for i in range(q(0x10)):
+        eid, count, first = struct.unpack_from('<qqq', data, events_at + i * 0x30)
+        items = []
+        for k in range(count):
+            bank, iid, length, offset = struct.unpack_from('<iiqq', data, instructions_at + first + k * 0x20)
+            items.append((bank, iid, args_at + offset, data[args_at + offset:args_at + offset + length]))
+        out[eid] = items
+    return out
+
+
+def patch_nt_curtain(data):
+    data = bytearray(data)
+    hits = [(o, a) for b, i, o, a in emevd_events(bytes(data)).get(180000550, []) if (b, i) == (2005, 3)]
+    if len(hits) != 1 or struct.unpack_from('<ii', hits[0][1]) != (0, 1):
+        raise ValueError('m80 curtain event has an unexpected form')
+    struct.pack_into('<i', data, hits[0][0] + 4, 0)
+    return bytes(data)
+
+
+def patch_nt_boundary(data):
+    data = bytearray(data)
+    hits = [(o, a) for b, i, o, a in emevd_events(bytes(data)).get(181001840, []) if (b, i) == (3, 27)]
+    if len(hits) != 2 or any(a[1] != 1 for _, a in hits):
+        raise ValueError('m81 boundary event has an unexpected form')
+    for o, _ in hits:
+        data[o + 1] = 0
+    return bytes(data)
+
+
+NT_PATCHES = [('event/m80_00_00_00.emevd.dcx', patch_nt_curtain),
+              ('event/m81_00_00_00.emevd.dcx', patch_nt_boundary)]
+
+# Falls (exefs IPS, main of the network test). The tutorial maps send a player who drops into the
+# valleys back up the cliff, and a long drop kills on landing:
+#   - the player's fall-return step (CSChrLocalPlayerFallReturnStep, player+0x27e0) fades out and
+#     warps the player back. Its STEP_Launch (0xe17654) now just asks for STEP_Init again
+#     (SetNextStep(0), 0xe1792c), so the request is dropped and the player stays where they landed.
+#   - the player's fall module (built at 0x17a3624) reads the debug switch GameData.DisableFallDamage
+#     into its +0x10 byte; `and w8, w0, #1` becomes `mov w8, #1`, so falls never hurt the player.
+#   - the fall-death sequence (CSFallDeadStep: fall camera, fade, warp back) starts from its
+#     STEP_Standby (0x1dfeaec) when the player's module +0xf0 has its +0x25 flag set. Standby now
+#     always takes its "cannot start" path, which clears the flag and stays in Standby.
+#   - on landing (0x1983134) the fall module asks its vtable +0x18 for the damage (share of max HP)
+#     and +0x20 whether the height is deadly. The player's fall module (vtable 0x573c888) now
+#     answers 0.0 (0x19851ec) and false (0x198523c). Enemies and CPU players keep theirs.
+EXPLORATION_CODE = {0xe17654: 0x2a1f03e1,    # mov w1, wzr
+           0xe17658: 0x140000b5,    # b   0xe1792c (SetNextStep)
+           0x17a3658: 0x52800028,   # mov w8, #1
+           0x1dfeb2c: 0xaa0003f3,   # mov x19, x0
+           0x1dfeb30: 0x14000017,   # b   0x1dfeb8c (clear the flag, stay in Standby)
+           0x19851ec: 0x2f00e400,   # movi d0, #0     (fall damage ratio)
+           0x19851f0: 0xd65f03c0,   # ret
+           0x198523c: 0x2a1f03e0,   # mov w0, wzr     (height is not deadly)
+           0x1985240: 0xd65f03c0,   # ret
+           0xda2cc8: 0x14000030,    # b 0xda2d88      (no warp back to a stored position)
+           0xcad7bc: 0x2a1f03f3,    # mov w19, wzr    (camera: WorldChrMan+0x1b8 'fall-death camera' flag ignored)
+           # TryFallDeath (0x19837e8, x0 = fall module): returns 0 at once for the local player.
+           0x1983828: 0x17fc4f97,   # b    0x1897684 (code cave: alignment padding)
+           0x1897684: 0xb47612b4,   # cbz  x20, 0x19838d8      (no WorldChrMan: original assert)
+           0x1897688: 0xf940d68a,   # ldr  x10, [x20, #0x1a8]  (local player)
+           0x189768c: 0xf940066b,   # ldr  x11, [x19, #8]      (this module's character)
+           0x1897690: 0xeb0b015f,   # cmp  x10, x11
+           0x1897694: 0x54761180,   # b.eq 0x19838c4           (return 0: no fall death)
+           0x1897698: 0x1403b065}   # b    0x198382c           (back to the original code)
+# Traced in game with the emulator's GDB stub: a deep drop calls TryFallDeath every frame; its
+# 0x1983900 part kills the character (state 6) or, below the map's death height (global
+# [0x59e9bc0]+8 vs +0x780), starts the fall-death camera (state 0xe, module flag +0x25). A copy
+# of the death-height check at 0xda2c9c warps the character back to a stored position; skipped.
+# The camera manager update (0xcad780) switches to FallDieCam (mode 5, [mgr+0x99]) while the byte
+# WorldChrMan+0x1b8 is set; it is read as 0.
+
+
+EXPLORATION_MOD = 'Burning Forest Exploration (playDB-CNT)'
+
+
+def exploration_ips():
+    out = bytearray(b'IPS32')
+    for address, word in sorted(EXPLORATION_CODE.items()):
+        out += struct.pack('>IH', 0x100 + address, 4) + struct.pack('<I', word)
+    return bytes(out + b'EEOF')
+
+
+def install_nt_unlocks(game, load_dir, ooz):
+    """The hub curtain and the courtyard boundary opened: <load>/<title>/NT Unlocks/romfs/event."""
+    mod = Path(load_dir) / TITLE_ID / NT_MOD
+    sources = {rel: game.read(rel) for rel, _ in NT_PATCHES}
+    if not all(sources.values()):
+        raise ValueError('the game\'s event scripts were not found')
+    wanted = {'version': NT_STAMP_VERSION,
+              'source': {rel: hashlib.sha256(blob).hexdigest() for rel, blob in sources.items()}}
+    try:
+        if json.loads((mod / NT_STAMP).read_text(encoding='utf-8')) == wanted:
+            return False
+    except (OSError, ValueError):
+        pass
+    staging = mod.with_name(NT_MOD + '.new')
+    shutil.rmtree(staging, ignore_errors=True)
+    for rel, patch in NT_PATCHES:
+        target = staging / 'romfs' / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(dcx_dflt(patch(undcx(sources[rel], ooz))))
+    (staging / NT_STAMP).write_text(json.dumps(wanted), encoding='utf-8')
+    shutil.rmtree(mod, ignore_errors=True)
+    staging.rename(mod)
+    return True
+
+
+def remove_nt_unlocks(load_dir):
+    shutil.rmtree(Path(load_dir) / TITLE_ID / NT_MOD, ignore_errors=True)
+
+
+def install_exploration(load_dir):
+    """Burning Forest Exploration (the fall patches above): <load>/<title>/<mod>/exefs/<build>.ips."""
+    target = Path(load_dir) / TITLE_ID / EXPLORATION_MOD / 'exefs' / f'{MAIN_BUILD_ID}.ips'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(exploration_ips())
+
+
+def remove_exploration(load_dir):
+    shutil.rmtree(Path(load_dir) / TITLE_ID / EXPLORATION_MOD, ignore_errors=True)
+
+
+# --- Courtyard targets ----------------------------------------------------------------------------
+# The courtyard's training targets (Travel / Courtyard Remembrance) are copied from a pool of
+# characters kept out of sight in the House of Night map (m80): parts c2000_0000-0005 (Adherents),
+# c2010_0000/0001 (Giant adherent) and c2210_0000/0001 (Graveyard Scarecrow); each model entry is
+# used by its pool parts only. A slot becomes another character by renaming its model entry in
+# place (model names are 5 letters) and giving its parts that character's NPC and AI ids; a
+# Bloodsworn instead points the parts at the map's c0000 (human) model with that Bloodsworn's
+# CharaInit preset and the duel AI the tutorial's opponent uses. The menu shows the character's
+# name (install_text_mod); the picture stays the target's own (the game has no other pictures).
+
+COURTYARD_MOD = 'Courtyard Targets (playDB-CNT)'
+COURTYARD_STAMP = 'courtyard.json'
+COURTYARD_SLOTS = {   # slot: pool model, (name text, info text) in PHX_MenuText, label
+    'giant': {'model': 'c2010', 'text': (253021, 253022), 'label': 'Giant adherent'},
+    'adherent': {'model': 'c2000', 'text': (253011, 253012), 'label': 'Adherent', 'group': 3},
+    'scarecrow': {'model': 'c2210', 'text': (253041, 253042), 'label': 'Graveyard Scarecrow'},
+}
+PART_MODEL_INDEX, PART_THINK, PART_NPC, PART_CHARA_INIT = 0x14, 0x2c0, 0x2c4, 0x2d0
+COURTYARD_DUMMY = (208000, 208000)   # AI and NPC ids of the hub's own c1000 dummy
+
+
+def _character(kind, name, model, npc, think, text, chara_init=-1):
+    return {'kind': kind, 'name': name, 'model': model, 'npc': npc, 'think': think, 'text': text,
+            'chara_init': chara_init}
+
+
+# NPC and AI ids as the full match map places these characters; names from the game's text
+# ('npc': NpcName in item_nt, 'buddy': BuddyName and 'menu': PHX_MenuText in menu_nt).
+COURTYARD_CHARACTERS = {
+    'vampyr': _character('Boss', 'Vampyr', 'c2140', 21400000, 21400000, ('npc', 21400)),
+    'beastridden': _character('Boss', 'Beastridden', 'c2070', 20700000, 20700000, ('npc', 20700)),
+    'giant_beastridden': _character('Boss', 'Giant Beastridden', 'c2071', 20710000, 20710000, ('npc', 20710)),
+    'lady_of_the_bog': _character('Boss', 'Lady of the Bog', 'c2080', 20800000, 20800050, ('npc', 20800)),
+    'rana': _character('Boss', 'Rana, Lady of the Bog', 'c2081', 20810000, 20810050, ('npc', 20810)),
+    'milhusa': _character('Boss', 'Milhüsa Cavalry', 'c2100', 21000000, 21000000, ('npc', 21005)),
+    'milhusa_2': _character('Boss', 'Milhüsa Cavalry (II)', 'c2101', 21010000, 21010000, ('npc', 21005)),
+    'milhusa_3': _character('Boss', 'Milhüsa Cavalry (III)', 'c2103', 21030000, 21030000, ('npc', 21005)),
+    'dark_leopard': _character('Boss', 'Dark Leopard', 'c2040', 20400000, 20400000, ('npc', 20400)),
+    'nikke': _character('Boss', 'Nikke', 'c6000', 60000000, 60000050, ('npc', 60000)),
+    'avester': _character('Kin', 'Thaumaturge Avester', 'c6010', 60100000, 60100000, ('buddy', 601000)),
+    'beatrice': _character('Kin', 'Gunslinger Beatrice', 'c6020', 60200000, 60200000, ('buddy', 602000)),
+    'baritone': _character('Kin', 'Baritone', 'c6030', 60300000, 60300000, ('buddy', 603000)),
+    'marlowe': _character('Kin', 'Undead Marlowe', 'c6040', 60400000, 60400000, ('buddy', 604000)),
+    'nia': _character('Kin', 'Nia, Sister of the Briar', 'c6070', 60700000, 60700000, ('buddy', 607000)),
+    'valentius': _character('Kin', 'Valentius the Unwise', 'c6090', 60900000, 60900000, ('buddy', 609000)),
+    'black_wulf': _character('Kin', 'Black Wulf of Mors', 'c6100', 61000000, 61000000, ('buddy', 610000)),
+    'gargoyle': _character('Kin', 'Gargoyle', 'c6130', 61300000, 61300000, ('buddy', 613000)),
+    'albert': _character('Bloodsworn', 'Albert', 'c0000', 55000, 55000, ('menu', 230911), 600000),
+    'jan': _character('Bloodsworn', 'Bloodhand Jan', 'c0000', 55000, 55000, ('menu', 230912), 600010),
+    'trang_lanh': _character('Bloodsworn', 'Trang Lanh', 'c0000', 55000, 55000, ('menu', 230913), 600020),
+    'layla': _character('Bloodsworn', 'Sniper Layla', 'c0000', 55000, 55000, ('menu', 230914), 600030),
+    'samir': _character('Bloodsworn', 'Senator Samir Patres', 'c0000', 55000, 55000, ('menu', 230915), 600040),
+    'zork': _character('Bloodsworn', 'Zork', 'c0000', 55000, 55000, ('menu', 230916), 600050),
+    'adherent': _character('Enemy', 'Adherent', 'c2000', 20005000, 20000000, ('menu', 253011)),
+    'giant_adherent': _character('Enemy', 'Giant adherent', 'c2010', 20105009, 20100000, ('menu', 253021)),
+    'scarecrow': _character('Enemy', 'Graveyard Scarecrow', 'c2210', 22100000, 22100000, ('menu', 253041)),
+}
+
+
+def _utf16_at(data, offset):
+    end = offset
+    while data[end:end + 2] != b'\0\0':
+        end += 2
+    return data[offset:end].decode('utf-16le')
+
+
+def msb_lists(data):
+    """{list name: [entry offsets]} of an MSB (Elden Ring style)."""
+    out, at = {}, 0x10
+    while at:
+        _, count, name_at = struct.unpack_from('<iiq', data, at)
+        offsets = struct.unpack_from(f'<{count}q', data, at + 0x10)
+        out[_utf16_at(data, name_at)] = list(offsets[:-1])
+        at = offsets[-1]
+    return out
+
+
+def swap_courtyard_targets(msb, choices):
+    """The House of Night map with each slot's pool characters replaced ({slot: character key})."""
+    data = bytearray(msb)
+    lists = msb_lists(bytes(data))
+    models = {}   # model name -> (index, entry offset, name offset, sib offset)
+    for index, entry in enumerate(lists['MODEL_PARAM_ST']):
+        name_at = entry + struct.unpack_from('<q', data, entry)[0]
+        sib_at = entry + struct.unpack_from('<q', data, entry + 0x10)[0]
+        models.setdefault(_utf16_at(data, name_at), (index, entry, name_at, sib_at))
+    human = models.get('c0000')
+    parts = [(entry, _utf16_at(data, entry + struct.unpack_from('<q', data, entry)[0]))
+             for entry in lists['PARTS_PARAM_ST']]
+    for slot, key in choices.items():
+        pool, character = COURTYARD_SLOTS[slot]['model'], COURTYARD_CHARACTERS[key]
+        if pool not in models:
+            raise ValueError(f'the House of Night map has no {pool} training pool')
+        index, entry, name_at, sib_at = models[pool]
+        mine = [e for e, n in parts if n.startswith(pool + '_') and
+                struct.unpack_from('<i', data, e + PART_MODEL_INDEX)[0] == index]
+        if not mine:
+            raise ValueError(f'the House of Night map has an unexpected {pool} pool')
+        if character['model'] == 'c0000':
+            if not human:
+                raise ValueError('the House of Night map has no human model')
+            for e in mine:
+                struct.pack_into('<i', data, e + PART_MODEL_INDEX, human[0])
+            for model_entry, delta in ((entry, -len(mine)), (human[1], len(mine))):
+                count = struct.unpack_from('<i', data, model_entry + 0x18)[0]
+                struct.pack_into('<i', data, model_entry + 0x18, count + delta)
+        elif character['model'] != pool:
+            if len(character['model']) != 5 or _utf16_at(data, sib_at) != pool + '.sib':
+                raise ValueError(f'unexpected {pool} model entry')
+            data[name_at:name_at + 10] = character['model'].encode('utf-16le')
+            data[sib_at:sib_at + 10] = character['model'].encode('utf-16le')
+        for e in mine:
+            struct.pack_into('<ii', data, e + PART_THINK, character['think'], character['npc'])
+            struct.pack_into('<i', data, e + PART_CHARA_INIT, character['chara_init'])
+        group = COURTYARD_SLOTS[slot].get('group', 1)
+        if character['kind'] != 'Enemy' and group > 1:
+            # One of a kind: the target spawns `group` parts at once (two sets of them in the
+            # pool), so all but the first of each set become the map's invisible dummy (c1000).
+            dummy = models.get('c1000')
+            if not dummy:
+                raise ValueError('the House of Night map has no dummy model')
+            source = human if character['model'] == 'c0000' else models[pool]
+            extras = [e for i, e in enumerate(mine) if i % group]
+            for e in extras:
+                struct.pack_into('<i', data, e + PART_MODEL_INDEX, dummy[0])
+                struct.pack_into('<ii', data, e + PART_THINK, *COURTYARD_DUMMY)
+                struct.pack_into('<i', data, e + PART_CHARA_INIT, -1)
+            for model_entry, delta in ((source[1], -len(extras)), (dummy[1], len(extras))):
+                count = struct.unpack_from('<i', data, model_entry + 0x18)[0]
+                struct.pack_into('<i', data, model_entry + 0x18, count + delta)
+    return bytes(data)
+
+
+def install_courtyard_targets(game, load_dir, ooz, choices):
+    """The courtyard's targets replaced as chosen ({slot: character key}); returns the names."""
+    choices = {s: k for s, k in choices.items() if s in COURTYARD_SLOTS and k in COURTYARD_CHARACTERS}
+    mod = Path(load_dir) / TITLE_ID / COURTYARD_MOD
+    shutil.rmtree(Path(load_dir) / TITLE_ID / 'Courtyard Boss (playDB-CNT)', ignore_errors=True)  # 1.5 tests
+    if not choices:
+        shutil.rmtree(mod, ignore_errors=True)
+        return {}
+    rel = 'map/mapstudio/m80_00_00_00.msb.dcx'
+    source = game.read(rel)
+    if not source:
+        raise ValueError('the House of Night map was not found')
+    wanted = {'version': 3, 'choices': sorted(choices.items()), 'source': hashlib.sha256(source).hexdigest()}
+    names = {s: COURTYARD_CHARACTERS[k]['name'] for s, k in choices.items()}
+    try:
+        if json.loads((mod / COURTYARD_STAMP).read_text(encoding='utf-8')) == wanted:
+            return names
+    except (OSError, ValueError):
+        pass
+    staging = mod.with_name(COURTYARD_MOD + '.new')
+    shutil.rmtree(staging, ignore_errors=True)
+    target = staging / 'romfs' / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(dcx_dflt(swap_courtyard_targets(undcx(source, ooz), choices)))
+    (staging / COURTYARD_STAMP).write_text(json.dumps(wanted), encoding='utf-8')
+    shutil.rmtree(mod, ignore_errors=True)
+    staging.rename(mod)
+    return names
+
+
+def remove_courtyard_targets(load_dir):
+    for name in (COURTYARD_MOD, 'Courtyard Boss (playDB-CNT)'):
+        shutil.rmtree(Path(load_dir) / TITLE_ID / name, ignore_errors=True)
 
 
 # --- Certificate archive for emulators without the online patch ---------------------------------
