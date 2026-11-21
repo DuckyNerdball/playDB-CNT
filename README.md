@@ -32,8 +32,14 @@ What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 
 Get the newest files from the [Releases page](https://github.com/sikoGD/playDB-CNT/releases).
 
-**Windows**: download `Play.Duskbloods.exe`, put it anywhere (next to your emulator is easiest)
-and run it.
+**Windows**: download `Play-Duskbloods-win.zip`, unzip it anywhere (next to your emulator is
+easiest) and run **Play Duskbloods.exe** from the extracted **Play Duskbloods** folder. Keep the
+folder together — the `.exe` uses the files next to it.
+
+> The Windows build is a zipped folder, not a single `.exe`, on purpose: a one-file packed `.exe`
+> gets a false *Trojan:Win32/Wacatac* warning from Windows Defender (and browsers may block the
+> download). It is a known machine-learning false positive for PyInstaller one-file programs, not
+> real malware. The folder build is not flagged.
 
 **Linux**: download `Play-Duskbloods-linux.tar.gz`, then:
 
@@ -73,9 +79,10 @@ Then, in the launcher:
 * **"Online connection is required" / "Unable to connect to the internet"**: the emulator has no
   Duskbloods online support. On Windows use **Patch Lichii**; with Lichii build 341+ you need
   launcher 1.4.1 or later.
-* **"Virus detected" when downloading**: a false positive that some antivirus programs report
-  for Python programs packed into one exe. You can also run the launcher from source
-  (`python play_duskbloods.py`).
+* **"Virus detected" when downloading**: a false positive that some antivirus programs report for
+  Python programs packed into one exe. The Windows download is now the zipped **folder** build
+  (`Play-Duskbloods-win.zip`), which is not flagged — use that instead of any single `.exe`. You
+  can also run the launcher from source (`python play_duskbloods.py`).
 * **"Port 18443 is already in use"**: an earlier session is still running; close it and retry.
 * **Reporting a bug**: press **Open logs** and attach the newest `runs/<time>` folder to an
   [issue](https://github.com/sikoGD/playDB-CNT/issues), or post it on our
